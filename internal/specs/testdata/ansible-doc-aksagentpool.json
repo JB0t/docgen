@@ -1,0 +1,157 @@
+{
+ "azure.azcollection.azure_rm_aksagentpool": {
+  "doc": {
+   "collection": "azure.azcollection",
+   "module": "azure_rm_aksagentpool",
+   "options": {
+    "ad_user": {
+     "description": [
+      "Active Directory username. Use when authenticating with an Active Directory user rather than service principal."
+     ],
+     "type": "str"
+    },
+    "auth_source": {
+     "choices": [
+      "auto",
+      "cli",
+      "credential_file",
+      "env",
+      "msi"
+     ],
+     "default": "auto",
+     "description": [
+      "Controls the source of the credentials to use for authentication.",
+      "Can also be set via the C(ANSIBLE_AZURE_AUTH_SOURCE) environment variable.",
+      "When set to C(auto) (the default) the precedence is module parameters -> C(env) -> C(credential_file) -> C(cli).",
+      "When set to C(env), the credentials will be read from the environment variables.",
+      "When set to C(credential_file), it will read the profile from C(~/.azure/credentials).",
+      "When set to C(cli), the credentials will be sources from the Azure CLI profile. C(subscription_id) or the environment variable C(AZURE_SUBSCRIPTION_ID) can be used to identify the subscription ID if more than one is present otherwise the default az cli subscription is used.",
+      "When set to C(msi), the host machine must be an azure resource with an enabled MSI extension. C(subscription_id) or the environment variable C(AZURE_SUBSCRIPTION_ID) can be used to identify the subscription ID if the resource is granted access to more than one subscription, otherwise the first subscription is chosen.",
+      "The C(msi) was added in Ansible 2.6."
+     ],
+     "type": "str",
+     "version_added": "0.0.1",
+     "version_added_collection": "azure.azcollection"
+    },
+    "cluster_name": {
+     "description": [
+      "The name of the kubernetes cluster."
+     ],
+     "required": true,
+     "type": "str"
+    },
+    "count": {
+     "description": [
+      "Number of agents (VMs) to host docker containers."
+     ],
+     "type": "int"
+    },
+    "kubelet_config": {
+     "description": [
+      "The Kubelet configuration on the agent pool nodes."
+     ],
+     "suboptions": {
+      "allowed_unsafe_sysctls": {
+       "description": [
+        "Allowed list of unsafe sysctls or unsafe sysctl patterns."
+       ],
+       "elements": "str",
+       "type": "list"
+      },
+      "container_log_max_files": {
+       "description": [
+        "The maximum number of container log files that can be present for a container. The number must be \u2265 2."
+       ],
+       "type": "int"
+      },
+      "container_log_max_size_mb": {
+       "description": [
+        "The maximum size of container log file before it is rotated."
+       ],
+       "type": "int"
+      }
+     },
+     "type": "dict"
+    },
+    "mode": {
+     "choices": [
+      "System",
+      "User"
+     ],
+     "description": [
+      "AgentPoolMode represents mode of an agent pool."
+     ],
+     "type": "str"
+    },
+    "name": {
+     "description": [
+      "The name of the node agent pool."
+     ],
+     "required": true,
+     "type": "str"
+    },
+    "node_labels": {
+     "description": [
+      "Agent pool node labels to be persisted across all nodes in agent pool."
+     ],
+     "type": "dict"
+    },
+    "resource_group": {
+     "description": [
+      "The name of the resource group."
+     ],
+     "required": true,
+     "type": "str"
+    },
+    "state": {
+     "choices": [
+      "present",
+      "absent"
+     ],
+     "default": "present",
+     "description": [
+      "State of the automation runbook. Use C(present) to create or update a automation runbook and use C(absent) to delete."
+     ],
+     "type": "str"
+    },
+    "vm_size": {
+     "description": [
+      "Size of agent VMs"
+     ],
+     "type": "str"
+    },
+    "availability_zones": {
+     "choices": [
+      1,
+      2,
+      3
+     ],
+     "description": [
+      "Availability zones for nodes. Must use VirtualMachineScaleSets AgentPoolType."
+     ],
+     "elements": "int",
+     "type": "list"
+    },
+    "upgrade_settings": {
+     "description": [
+      "Settings for upgrading the agentpool."
+     ],
+     "suboptions": {
+      "max_surge": {
+       "description": [
+        "This can either be set to an integer, sucha as C(5) or percentage C(50%).",
+        "If a percentage is specified, it is the percentage of the total agent pool size at the time of the upgrade.",
+        "For percentages, fractional nodes are rounded up.",
+        "If not specified, the default is C(1)."
+       ],
+       "type": "str"
+      }
+     },
+     "type": "dict"
+    }
+   },
+   "short_description": "Manage node pools in Kubernetes kubernetes cluster"
+  },
+  "examples": "\n- name: Add new node agent pool\n  azure_rm_aksagentpool:\n    resource_group: \"{{ resource_group }}\"\n    cluster_name: aksfred01\n    name: default-new\n    count: 2\n    vm_size: Standard_B2s\n    type_properties_type: VirtualMachineScaleSets\n    mode: System\n    node_labels: {\"release\":\"stable\"}\n    max_pods: 42\n    orchestrator_version: 1.23.5\n    availability_zones:\n      - 1\n      - 2\n- name: Create a node agent pool with custom config\n  azure_rm_aksagentpool:\n    resource_group: \"{{ resource_group }}\"\n    cluster_name: \"min{{ rpfx }}\"\n    name: default-new2\n    count: 1\n    vm_size: Standard_B2s\n    type_properties_type: VirtualMachineScaleSets\n    mode: System\n    node_labels: {\"release\":\"stable\"}\n    max_pods: 42\n    enable_auto_scaling: true\n    min_count: 1\n    max_count: 10\n    orchestrator_version: 1.23.5\n    availability_zones:\n      - 1\n    kubelet_config:\n      cpu_manager_pol"
+ }
+}

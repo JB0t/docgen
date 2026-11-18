@@ -1,0 +1,126 @@
+#!/usr/bin/env bash
+# Finds the files a change concerns and asks docgen's local model for a patch:
+# docgen code --request REQUEST FILE... (it prints the diff, or applies it with --apply).
+#
+# Usage: diffgen [options] [FILE|DIR ...]
+#   -s, --search TERM     add every file containing TERM (git grep, fixed string; repeatable)
+#   -d, --dir DIR         where --search looks (default: the current directory)
+#   -r, --request TEXT    the change to make; @FILE reads it from a file; asked for when omitted
+#   -x, --exclude REGEX   drop paths matching REGEX (default: TODO, USAGE and README files)
+#   -f, --format FORMAT   diff (default) or blocks: search/replace blocks, which small models
+#                         get right more often (see docgen code --help)
+#   -a, --apply           apply the patch (docgen checks it with git apply --check first)
+#   -y, --yes             do not ask before running docgen
+#   -h, --help
+#
+# FILE, DIR and --dir may be relative to the current directory or absolute; they must be
+# inside the repository and are passed to docgen relative to its root, which is how
+# docgen reads them. Only tracked and untracked-but-not-ignored files are searched, so
+# .git, .venv and other ignored paths never end up in the prompt. docgen starts and stops
+# the model server itself (llm.start / llm.stop in docgen.yaml).
+#
+# Examples:
+#   diffgen -s timers -r "Move 'clctl tasks list-timers' to a new 'clctl timers list'"
+#   diffgen -s list-timers -d cmd -r @request.md --apply
+#   diffgen -r "Add a --json flag" cmd/timers.go
+set -euo pipefail
+
+usage() { sed -n '2,/^set -euo/{/^set -euo/d;s/^# \{0,1\}//;p}' "$0"; }
+die() { echo "diffgen: $*" >&2; exit 1; }
+
+searches=() paths=() dir=. request="" exclude='(^|/)(TODO|USAGE|README)[^/]*\.md$' apply=() format=() yes=""
+while (($#)); do
+    case "$1" in
+    -s | --search) searches+=("${2:?--search needs a term}"); shift ;;
+    -d | --dir) dir="${2:?--dir needs a directory}"; shift ;;
+    -r | --request) request="${2:?--request needs text}"; shift ;;
+    -x | --exclude) exclude="${2?--exclude needs a regex}"; shift ;;
+    -f | --format) format=(--format "${2:?--format needs diff or blocks}"); shift ;;
+    -a | --apply) apply=(--apply) ;;
+    -y | --yes) yes=1 ;;
+    -h | --help) usage; exit 0 ;;
+    --) shift; paths+=("$@"); break ;;
+    -*) die "unknown option $1 (see --help)" ;;
+    *) paths+=("$1") ;;
+    esac
+    shift
+done
+
+command -v docgen >/dev/null || die "docgen is not on PATH (install it: scripts/install.sh, or go install github.com/JB0t/docgen@latest)"
+root="$(git rev-parse --show-toplevel 2>/dev/null)" || die "run diffgen inside a git repository"
+interactive=""
+[[ -t 0 && -t 2 ]] && interactive=1
+
+# relative PATH: prints PATH relative to the repository root, or fails when it is outside.
+relative() {
+    local rel
+    rel="$(realpath -m --relative-to="$root" -- "$1")"
+    [[ "$rel" == .. || "$rel" == ../* ]] && die "$1 is outside the repository $root"
+    printf '%s\n' "$rel"
+}
+
+if ((${#searches[@]} == 0 && ${#paths[@]} == 0)); then
+    [[ -n "$interactive" ]] || die "give --search TERM or files (see --help)"
+    read -rp "Search term: " term
+    [[ -n "$term" ]] || die "the search term can't be empty"
+    searches+=("$term")
+    read -rp "Directory to search [${dir}]: " answer
+    dir="${answer:-$dir}"
+fi
+[[ -e "$dir" ]] || die "no such directory: $dir"
+search_dir="$(relative "$dir")"
+
+files=()
+for path in "${paths[@]}"; do
+    [[ -e "$path" ]] || die "no such file or directory: $path"
+    files+=("$(relative "$path")")
+done
+for term in "${searches[@]}"; do
+    # -z: NUL-separated, so any file name survives; -I: skip binary files.
+    while IFS= read -r -d '' found; do
+        files+=("$found")
+    done < <(git -C "$root" grep -z -l -I -F --untracked -e "$term" -- "$search_dir" || true)
+done
+
+# Drop exclusions and duplicates, keeping the order found.
+declare -A seen=()
+kept=()
+for file in "${files[@]}"; do
+    [[ -n "${seen[$file]:-}" ]] && continue
+    seen[$file]=1
+    [[ -n "$exclude" && "$file" =~ $exclude ]] && continue
+    kept+=("$file")
+done
+((${#kept[@]})) || die "no files found (search: ${searches[*]:-none}, in: $search_dir)"
+
+if [[ -z "$request" ]]; then
+    [[ -n "$interactive" ]] || die "give --request TEXT"
+    read -rp "Request: " request
+fi
+if [[ "$request" == @* ]]; then
+    [[ -f "${request#@}" ]] || die "no such request file: ${request#@}"
+    request="$(<"${request#@}")"
+fi
+[[ -n "${request//[[:space:]]/}" ]] || die "the request can't be empty"
+
+# Rough size check: docgen refuses prompts over llm.max_source_toks.
+chars=${#request}
+for file in "${kept[@]}"; do
+    [[ -d "$root/$file" ]] && continue
+    chars=$((chars + $(wc -c <"$root/$file")))
+done
+echo "Files (${#kept[@]}), relative to $root:" >&2
+printf '  %s\n' "${kept[@]}" >&2
+echo "About $((chars * 10 / 32)) tokens of source (3.2 characters per token, as docgen estimates)." >&2
+
+if [[ -z "$yes" ]]; then
+    if [[ -n "$interactive" ]]; then
+        read -rp "Run docgen code${apply:+ --apply} on these files? [y/N] " answer
+        [[ "$answer" == [yY]* ]] || { echo "Cancelled." >&2; exit 130; }
+    else
+        die "not a terminal: pass --yes to run without asking"
+    fi
+fi
+
+cd "$root"
+exec docgen code "${apply[@]}" "${format[@]}" --request "$request" -- "${kept[@]}"

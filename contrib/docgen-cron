@@ -1,0 +1,116 @@
+#!/usr/bin/env bash
+# Keeps docgen's generated documentation current in a list of repositories, unattended.
+# For each repo it runs 'docgen draft --all' (redrafts only generated sections whose sources
+# changed; never touches hand-written text) and 'docgen check', and keeps a report. A repo
+# is skipped when nothing changed since the last run, so the schedule can be hourly or
+# daily alike: work happens only after a commit or an edit. It never runs 'check --fix':
+# correcting hand-written text is a decision for whoever is at the keyboard
+# (docgen check --fix, by hand, in the repo).
+#
+# Usage: docgen-cron [options] [REPO ...]
+#   REPO            repository paths; default: the lines of ~/.config/docgen/repos
+#   --force         run even when a repo has not changed since the last run
+#   --commit        in a repo whose working tree was clean before the run, commit what draft
+#                   wrote ("docs: docgen draft"); a dirty tree is left for the owner to review
+#   --dry-run       say what would run; run nothing
+#   --install-cron [SCHEDULE]  print the crontab line (default "15 2 * * *": 02:15 daily)
+#   -h, --help
+#
+# Reports: ~/.local/state/docgen/<repo name>.log (last run) and summary.log (every run).
+# State:   ~/.local/state/docgen/<repo name>.last (the tree hash of the last run).
+# docgen starts and stops the model server itself (llm.start/llm.stop in docgen.yaml);
+# a run that finds llm-server busy with the other preset fails for that repo and is retried
+# next time. cron's PATH is /usr/bin:/bin: the crontab line below adds ~/.local/bin.
+set -euo pipefail
+
+die() { echo "docgen-cron: $*" >&2; exit 1; }
+
+state_dir="${XDG_STATE_HOME:-$HOME/.local/state}/docgen"
+list_file="${XDG_CONFIG_HOME:-$HOME/.config}/docgen/repos"
+force="" commit="" dry_run="" repos=()
+while (($#)); do
+    case "$1" in
+    --force) force=1 ;;
+    --commit) commit=1 ;;
+    --dry-run) dry_run=1 ;;
+    --install-cron)
+        schedule="${2:-15 2 * * *}"; [[ "${2:-}" == -* || -z "${2:-}" ]] || shift
+        here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+        echo "# docgen: keep generated docs current in the repos listed in $list_file"
+        echo "$schedule PATH=\$HOME/.local/bin:/usr/bin:/bin $here/docgen-cron >> $state_dir/cron.log 2>&1"
+        exit 0
+        ;;
+    -h | --help) sed -n '2,/^set -euo/{/^set -euo/d;s/^# \{0,1\}//;p}' "$0"; exit 0 ;;
+    -*) die "unknown option $1 (see --help)" ;;
+    *) repos+=("$1") ;;
+    esac
+    shift
+done
+
+if ((${#repos[@]} == 0)); then
+    [[ -f "$list_file" ]] || die "no repositories given and $list_file does not exist (one repository path per line, # comments allowed)"
+    while IFS= read -r line; do
+        line="${line%%#*}"; line="${line//[[:space:]]/}"
+        [[ -n "$line" ]] && repos+=("${line/#\~/$HOME}")
+    done <"$list_file"
+    ((${#repos[@]} > 0)) || die "$list_file lists no repositories"
+fi
+command -v docgen >/dev/null || die "docgen is not on PATH (scripts/install.sh, or go install github.com/JB0t/docgen@latest)"
+mkdir -p "$state_dir"
+
+# tree_hash REPO: one hash for HEAD plus every tracked or untracked-not-ignored file's
+# content, so an uncommitted edit counts as a change too.
+tree_hash() {
+    (cd "$1" && { git rev-parse HEAD 2>/dev/null || true; git ls-files -z --cached --others --exclude-standard 2>/dev/null | sort -z | xargs -0 sha256sum 2>/dev/null; } | sha256sum | cut -c1-16)
+}
+
+summary="$state_dir/summary.log"
+started=$(date -Iseconds)
+ran=0 skipped=0 failed=0
+for repo in "${repos[@]}"; do
+    name="$(basename "$repo")"
+    if [[ ! -d "$repo/.git" ]]; then
+        echo "$started $name: not a git repository ($repo)" | tee -a "$summary" >&2
+        failed=$((failed + 1))
+        continue
+    fi
+    hash="$(tree_hash "$repo")"
+    last_file="$state_dir/$name.last"
+    if [[ -z "$force" && -f "$last_file" && "$(cat "$last_file")" == "$hash" ]]; then
+        skipped=$((skipped + 1))
+        [[ -n "$dry_run" ]] && echo "$name: unchanged since last run, skip"
+        continue
+    fi
+    if [[ -n "$dry_run" ]]; then
+        echo "$name: changed, would run docgen draft --all && docgen check in $repo"
+        continue
+    fi
+    log="$state_dir/$name.log"
+    clean=""
+    [[ -z "$(git -C "$repo" status --porcelain)" ]] && clean=1
+    {
+        echo "== $started $name ($repo) tree $hash"
+        echo "-- draft"
+        (cd "$repo" && docgen draft --all) && draft_ok=1 || draft_ok=""
+        echo "-- check"
+        (cd "$repo" && docgen check) && check_ok=1 || check_ok=""
+    } >"$log" 2>&1 || true
+    changed_files="$(git -C "$repo" status --porcelain | wc -l)"
+    result="draft $([[ -n "$draft_ok" ]] && echo ok || echo FAILED), check $([[ -n "$check_ok" ]] && echo clean || echo "has errors"), $changed_files file(s) changed"
+    if [[ -n "$commit" && -n "$clean" && "$changed_files" != 0 ]]; then
+        if git -C "$repo" add -A && git -C "$repo" commit -q -m "docs: docgen draft (generated sections, $(date +%F))"; then
+            result="$result, committed"
+        else
+            result="$result, commit FAILED"
+        fi
+    elif [[ -n "$commit" && -z "$clean" && "$changed_files" != 0 ]]; then
+        result="$result, not committed (tree was dirty before the run)"
+    fi
+    # Record the tree as it is now (after draft's writes and any commit), so the next run
+    # skips unless something else changes.
+    if [[ -n "$draft_ok" ]]; then tree_hash "$repo" >"$last_file"; else failed=$((failed + 1)); fi
+    ran=$((ran + 1))
+    echo "$started $name: $result (log: $log)" | tee -a "$summary"
+done
+[[ -n "$dry_run" ]] || echo "$started done: $ran run, $skipped unchanged, $failed failed" | tee -a "$summary"
+((failed == 0))

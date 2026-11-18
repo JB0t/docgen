@@ -1,0 +1,106 @@
+name: Release
+
+# Runs on every push to main. Only release/* pull requests can merge into main
+# (the release-gate check), so a push here is a release merge: this tags
+# vX.Y.Z, publishes the GitHub release with the binaries (GoReleaser, notes
+# from the CHANGELOG.md section), merges the back-merge pull request
+# release/X.Y.Z -> dev and deletes the release branch.
+#
+# A push to main that is not a release merge (the first commit) tags nothing.
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Release version
+        id: version
+        run: |
+          subject="$(git log -1 --format=%s)"
+          re='^Merge pull request #[0-9]+ from [^/]+/release/([0-9]+\.[0-9]+\.[0-9]+)$'
+          if [[ "$subject" =~ $re ]]; then
+            version="${BASH_REMATCH[1]}"
+          elif [[ "$subject" =~ ^chore\(release\):\ ([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
+            version="${BASH_REMATCH[1]}"
+          else
+            echo "Not a release merge ($subject) - nothing to release."
+            exit 0
+          fi
+          if git rev-parse -q --verify "refs/tags/v${version}" >/dev/null; then
+            echo "v${version} already exists - nothing to do."
+            exit 0
+          fi
+          # The release notes: this version's CHANGELOG.md section, without its heading.
+          awk -v h="## v${version}" '
+            /^## / { if (on) exit; if (index($0, h) == 1 && (length($0) == length(h) || substr($0, length(h) + 1, 1) == " ")) { on = 1; next } }
+            on
+          ' CHANGELOG.md > "$RUNNER_TEMP/notes.md"
+          if [ -z "$(tr -d '[:space:]' < "$RUNNER_TEMP/notes.md")" ]; then
+            echo "::error::CHANGELOG.md has no '## v${version}' section"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Tag
+        if: steps.version.outputs.version != ''
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "v${VERSION}" -m "v${VERSION}"
+          git push origin "refs/tags/v${VERSION}"
+
+      - uses: actions/setup-go@v6
+        if: steps.version.outputs.version != ''
+        with:
+          go-version-file: go.mod
+
+      - uses: goreleaser/goreleaser-action@v6
+        if: steps.version.outputs.version != ''
+        with:
+          distribution: goreleaser
+          version: "~> v2"
+          args: release --clean --release-notes ${{ runner.temp }}/notes.md
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BUILD_VERSION: ${{ steps.version.outputs.version }}
+
+      # The back-merge pull request ran the same checks on the same commit as
+      # the release, so it can merge straight away.
+      - name: Merge the back-merge into dev
+        if: steps.version.outputs.version != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          branch="release/${VERSION}"
+          pr="$(gh pr list --base dev --head "$branch" --state open --json number --jq '.[0].number // empty')"
+          if [ -z "$pr" ]; then
+            if git merge-base --is-ancestor "origin/${branch}" origin/dev 2>/dev/null; then
+              echo "${branch} is already in dev."
+            else
+              echo "::warning::No open pull request ${branch} -> dev and dev lacks it. Open one by hand: gh pr create --base dev --head ${branch}"
+              exit 0
+            fi
+          elif ! gh pr merge "$pr" --merge; then
+            echo "::warning::Could not merge #${pr} into dev now - set it to merge when its checks pass."
+            gh pr merge "$pr" --merge --auto
+            exit 0
+          fi
+          git push origin --delete "$branch" || echo "::warning::could not delete ${branch}"

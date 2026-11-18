@@ -1,0 +1,352 @@
+#!/usr/bin/env bash
+# Fits llm-server's presets (code: docgen, digest: clctl, embed: clctl search) to the machine
+# this runs on: discovers CPU, RAM, GPU, disk and the llama-server binary, picks for each
+# preset the largest model and context that fit safely, verifies the model tags exist on
+# Docker Hub's ai/ namespace, and writes the result as llm-server's config file
+# (${XDG_CONFIG_HOME:-~/.config}/llm-server/env), which llm-server sources on every run.
+# Nothing is downloaded or written without a prompt (--yes answers them all).
+#
+# Usage: llm-fit [--dry-run] [--yes] [--download] [--ctx N] [--reserve GB]
+#   --dry-run    show the plan only; write nothing
+#   --yes        no prompts: write the config, and download with --download
+#   --download   after writing, download every chosen model that is missing (asks per model)
+#   --ctx N      cap the context for the chat presets (default: 32768 if it fits)
+#   --reserve GB RAM to leave for everything else (default: 20% of total, at least 4 GB)
+#   --offline    do not query Docker Hub; use the built-in tag guesses, marked unverified
+#   --best       pick the best model that fits even if a smaller one is already downloaded
+#
+# How the fit works. Both chat presets are sized against the same budget because llm-server
+# runs only one of them at a time (the embed model is small and runs alongside either). With
+# an NVIDIA GPU and a CUDA build of llama-server the budget is free VRAM and the model is
+# offloaded fully (LLM_ARGS="-ngl 99"); otherwise it is available RAM minus the reserve. A
+# model fits when weights + KV cache for the context (q8_0, per-token size from the model's
+# architecture) + 1.5 GB of compute buffers + 10% stays under the budget. The ladder is tried
+# largest first at the full context, then at smaller contexts, so a tight machine gets the
+# biggest model it can hold at 8k before it gets a smaller model at 32k; a 7B coder with 8k is
+# usually more useful than a 1.5B with 32k. Threads: generation leaves two physical cores for
+# the rest of the machine, prompt batches use every physical core.
+set -euo pipefail
+
+die() { echo "llm-fit: $*" >&2; exit 1; }
+
+dry_run="" yes="" download="" offline="" best="" ctx_cap=32768 reserve_gb=""
+while (($#)); do
+    case "$1" in
+    --dry-run) dry_run=1 ;;
+    --yes | -y) yes=1 ;;
+    --download) download=1 ;;
+    --offline) offline=1 ;;
+    --best) best=1 ;;
+    --ctx) ctx_cap="${2:?--ctx needs a number}"; shift ;;
+    --reserve) reserve_gb="${2:?--reserve needs GB}"; shift ;;
+    -h | --help) sed -n '2,/^set -euo/{/^set -euo/d;s/^# \{0,1\}//;p}' "$0"; exit 0 ;;
+    *) die "unknown option $1 (see --help)" ;;
+    esac
+    shift
+done
+
+config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/llm-server"
+config_file="$config_dir/env"
+models_dir="$HOME/.local/share/llm/models"
+interactive=""
+[[ -t 0 && -t 2 ]] && interactive=1
+
+ask() { # ask QUESTION: yes with --yes; otherwise prompts, false when not a terminal
+    [[ -n "$yes" ]] && return 0
+    [[ -n "$interactive" ]] || return 1
+    local answer
+    read -rp "$1 [y/N] " answer
+    [[ "$answer" == [yY]* ]]
+}
+
+gb() { awk -v b="$1" 'BEGIN{printf "%.1f", b/1e9}'; }
+
+# ---------- discovery ----------
+kernel="$(uname -sr)"
+wsl=""; grep -qi microsoft /proc/version 2>/dev/null && wsl=1
+logical=$(nproc)
+physical=$(lscpu -p=core,socket 2>/dev/null | grep -v '^#' | sort -u | wc -l)
+((physical > 0)) || physical=$logical
+cpu_model=$(lscpu 2>/dev/null | sed -n 's/^Model name:[[:space:]]*//p' | head -1)
+mem_total=$(($(awk '/^MemTotal/{print $2}' /proc/meminfo) * 1024))
+mem_avail=$(($(awk '/^MemAvailable/{print $2}' /proc/meminfo) * 1024))
+swap_total=$(($(awk '/^SwapTotal/{print $2}' /proc/meminfo) * 1024))
+mkdir -p "$models_dir"
+disk_free=$(($(df -Pk "$models_dir" | awk 'NR==2{print $4}') * 1024))
+
+gpu_name="" gpu_vram_free=0 gpu_vram_total=0
+if command -v nvidia-smi >/dev/null && nvidia-smi --query-gpu=name,memory.free,memory.total --format=csv,noheader,nounits >/dev/null 2>&1; then
+    IFS=, read -r gpu_name free total < <(nvidia-smi --query-gpu=name,memory.free,memory.total --format=csv,noheader,nounits | head -1)
+    gpu_name="${gpu_name# }"; gpu_vram_free=$(( ${free// /} * 1024 * 1024 )); gpu_vram_total=$(( ${total// /} * 1024 * 1024 ))
+fi
+
+server="${LLM_SERVER:-$( (ls -d "$HOME"/.local/opt/llama.cpp/llama-b*/llama-server 2>/dev/null || true) | sort -V | tail -1)}"
+server_cuda=""
+if [[ -x "$server" ]]; then
+    if "$server" --list-devices 2>/dev/null | grep -qi 'cuda'; then server_cuda=1; fi
+fi
+
+# Budget: VRAM when the GPU is usable by this build, else RAM minus the reserve.
+if [[ -n "$reserve_gb" ]]; then
+    reserve=$(awk -v g="$reserve_gb" 'BEGIN{printf "%.0f", g*1e9}')
+else
+    reserve=$((mem_total / 5)); ((reserve < 4000000000)) && reserve=4000000000
+fi
+use_gpu=""
+if [[ -n "$gpu_name" && -n "$server_cuda" ]]; then
+    use_gpu=1
+    budget=$((gpu_vram_free - 1000000000))
+    budget_label="GPU VRAM free minus 1 GB"
+else
+    budget=$((mem_total - reserve))
+    budget_label="RAM total minus $(gb "$reserve") GB reserve"
+fi
+((budget > 0)) || budget=0
+low_available=""
+((mem_avail < budget)) && low_available=1
+
+echo "Host: $(hostname) ($kernel${wsl:+, WSL})"
+echo "CPU: ${cpu_model:-unknown}, $physical physical / $logical logical cores"
+echo "RAM: $(gb "$mem_total") GB total, $(gb "$mem_avail") GB available, swap $(gb "$swap_total") GB"
+if [[ -n "$gpu_name" ]]; then
+    if [[ -n "$server_cuda" ]]; then gpu_note="llama-server has CUDA: used"
+    elif [[ -x "$server" ]]; then gpu_note="this llama-server has no CUDA: GPU unused, install a cuda build to use it"
+    else gpu_note="install a cuda build of llama-server to use it"; fi
+    echo "GPU: $gpu_name, $(gb "$gpu_vram_free") / $(gb "$gpu_vram_total") GB VRAM free ($gpu_note)"
+else
+    echo "GPU: none detected"
+fi
+echo "Disk: $(gb "$disk_free") GB free under $models_dir"
+if [[ -x "$server" ]]; then
+    echo "llama-server: $server"
+else
+    echo "llama-server: NOT FOUND. Get a release from https://github.com/ggml-org/llama.cpp/releases" >&2
+    echo "  (the ubuntu-x64 build for CPU, a cuda build to use the GPU) and unpack it so the binary is" >&2
+    echo "  ~/.local/opt/llama.cpp/llama-bNNNN/llama-server, or set LLM_SERVER. Fitting continues." >&2
+fi
+echo "Budget for one chat model: $(gb "$budget") GB ($budget_label)"
+[[ -n "$low_available" && -z "$use_gpu" ]] && echo "note: only $(gb "$mem_avail") GB is free right now; the model needs the budget free when it starts (llm-server loads it with --load-mode dio, so the page cache does not count)"
+echo
+
+# ---------- the ladder ----------
+# name|preset|repo|tag regex (case-insensitive, first match on Docker Hub ai/REPO wins)|fallback tag|KB per token of KV cache at q8_0|GB of weights if Docker Hub cannot be asked|extra llama-server args|note
+# KV per token = layers * 2 (K and V) * kv_heads * head_dim * 1.07 bytes (q8_0 with scales), so
+# every chat entry keeps --cache-type-k/v q8_0; drop them and the cache doubles.
+ladder_code=(
+    "Qwen3-Coder-30B-A3B Q8|code|qwen3-coder|^30b-a3b-q8_0$|30b-a3b-q8_0|52|33|--jinja -fa on --cache-type-k q8_0 --cache-type-v q8_0|MoE, 3B active: fast on CPU, best quality"
+    "Qwen3-Coder-30B-A3B Q4_K_M|code|qwen3-coder|^30b-a3b-q4_k_m$|30b-a3b-q4_K_M|52|19|--jinja -fa on --cache-type-k q8_0 --cache-type-v q8_0|MoE, 3B active: fast on CPU"
+    "Qwen2.5-7B-Instruct Q4_K_M|code|qwen2.5|^7b-q4_k_m$|7B-Q4_K_M|31|4.7|--jinja -fa on --cache-type-k q8_0 --cache-type-v q8_0|dense 7B general model (Docker Hub has no qwen2.5-coder): fine on GPU, slow on CPU"
+    "Qwen3-4B-Instruct-2507 Q4_K_M|code|qwen3|^4b-instruct-2507-q4_k_m$|4b-instruct-2507-q4_K_M|79|2.5|--jinja -fa on --cache-type-k q8_0 --cache-type-v q8_0|small, no thinking blocks: simple edits only"
+    "Qwen2.5-3B-Instruct Q4_K_M|code|qwen2.5|^3b-q4_k_m$|3B-Q4_K_M|20|2.0|--jinja -fa on --cache-type-k q8_0 --cache-type-v q8_0|small: simple edits only"
+    "Qwen2.5-1.5B-Instruct F16|code|qwen2.5|^1\\.5b-f16$|1.5B-F16|15|3.1|--jinja -fa on --cache-type-k q8_0 --cache-type-v q8_0|tiny: last resort"
+)
+ladder_digest=(
+    "Qwen3-30B-A3B-Instruct-2507 Q8|digest|qwen3|^30b-a3b-instruct-2507-q8_0$|30b-a3b-instruct-2507-q8_0|52|33|--jinja -fa on --cache-type-k q8_0 --cache-type-v q8_0 --temp 0.7 --top-p 0.8 --top-k 20 --min-p 0|MoE: fast on CPU, best summaries"
+    "Qwen3-30B-A3B-Instruct-2507 Q4_K_M|digest|qwen3|^30b-a3b-instruct-2507-q4_k_m$|30b-a3b-instruct-2507-q4_K_M|52|19|--jinja -fa on --cache-type-k q8_0 --cache-type-v q8_0 --temp 0.7 --top-p 0.8 --top-k 20 --min-p 0|MoE: fast on CPU"
+    "Qwen2.5-7B-Instruct Q4_K_M|digest|qwen2.5|^7b-q4_k_m$|7B-Q4_K_M|31|4.7|--jinja -fa on --cache-type-k q8_0 --cache-type-v q8_0|dense 7B"
+    "Qwen3-4B-Instruct-2507 Q4_K_M|digest|qwen3|^4b-instruct-2507-q4_k_m$|4b-instruct-2507-q4_K_M|79|2.5|--jinja -fa on --cache-type-k q8_0 --cache-type-v q8_0 --temp 0.7 --top-p 0.8 --top-k 20 --min-p 0|small, no thinking blocks"
+    "Qwen2.5-3B-Instruct Q4_K_M|digest|qwen2.5|^3b-q4_k_m$|3B-Q4_K_M|20|2.0|--jinja -fa on --cache-type-k q8_0 --cache-type-v q8_0|small: short summaries only"
+    "Llama-3.2-3B-Instruct Q4_K_M|digest|llama3.2|^3b-q4_k_m$|3B-Q4_K_M|14|2.0|--jinja -fa on --cache-type-k q8_0 --cache-type-v q8_0|small alternative"
+)
+embed_entry="nomic-embed-text-v1.5 F16|embed|nomic-embed-text-v1.5|^latest$|latest|0|0.3|--embeddings --pooling mean -fa auto|always fits"
+
+# probe REPO REGEX FALLBACK: prints "TAG SIZE_BYTES VERIFIED" from Docker Hub, or the fallback
+# with size 0 when offline or unknown. One registry token per call; failures are quiet.
+probe() {
+    if [[ -n "$offline" ]]; then echo "$3 0 no"; return; fi
+    python3 -I - "$1" "$2" "$3" <<'PY' 2>/dev/null || echo "$3 0 no"
+import json, re, sys, urllib.request
+repo, pattern, fallback = sys.argv[1], re.compile(sys.argv[2], re.I), sys.argv[3]
+registry = f"https://registry-1.docker.io/v2/ai/{repo}"
+ACCEPT = ("application/vnd.oci.image.manifest.v1+json, application/vnd.oci.image.index.v1+json, "
+          "application/vnd.docker.distribution.manifest.v2+json")
+def get(url, auth, accept=None):
+    request = urllib.request.Request(url, headers={"Authorization": "Bearer " + auth})
+    if accept:
+        request.add_header("Accept", accept)
+    return urllib.request.urlopen(request, timeout=20)
+try:
+    with urllib.request.urlopen(f"https://auth.docker.io/token?service=registry.docker.io&scope=repository:ai/{repo}:pull", timeout=20) as r:
+        token = json.load(r)["token"]
+    with get(f"{registry}/tags/list", token) as r:
+        tags = json.load(r).get("tags", [])
+    tag = next((t for t in tags if pattern.match(t)), None)
+    if tag is None:
+        print(fallback, 0, "no"); sys.exit(0)
+    with get(f"{registry}/manifests/{tag}", token, ACCEPT) as r:
+        manifest = json.load(r)
+    if "manifests" in manifest:
+        with get(f"{registry}/manifests/{manifest['manifests'][0]['digest']}", token, ACCEPT) as r:
+            manifest = json.load(r)
+    size = sum(l["size"] for l in manifest.get("layers", []) if "gguf" in l["mediaType"] or "model.weight" in l["mediaType"])
+    print(tag, size, "yes")
+except Exception:
+    print(fallback, 0, "no")
+PY
+}
+
+# File names follow llm-server's convention: <repo>-<tag>.gguf, tag case kept (its default
+# code model is qwen3-coder-30b-a3b-q4_K_M.gguf), so models it already downloaded are found.
+model_file() { echo "$models_dir/$1-$2.gguf"; }
+
+# fit LADDER_NAME MIN_CTX: sets FIT_* for the first entry that fits at the largest context
+# not below MIN_CTX (a smaller model at MIN_CTX beats a bigger one that only fits below it).
+fit() {
+    local -n ladder="$1"
+    local min_ctx="${2:-4096}"
+    local entry name preset repo regex fallback kb_tok weights_gb extra note tag size verified
+    local ctx weights need
+    FIT_NAME="" FIT_PRESET="" FIT_REPO="" FIT_TAG="" FIT_SIZE=0 FIT_VERIFIED="" FIT_CTX=0 FIT_EXTRA="" FIT_NOTE="" FIT_NEED=0
+    local -a probed=()
+    for entry in "${ladder[@]}"; do
+        IFS='|' read -r name preset repo regex fallback kb_tok weights_gb extra note <<<"$entry"
+        read -r tag size verified < <(probe "$repo" "$regex" "$fallback")
+        ((size > 0)) || size=$(awk -v g="$weights_gb" 'BEGIN{printf "%.0f", g*1e9}')
+        probed+=("$name|$preset|$repo|$tag|$size|$verified|$kb_tok|$extra|$note")
+    done
+    for ctx in 32768 16384 8192 4096; do
+        ((ctx <= ctx_cap && ctx >= min_ctx)) || continue
+        for entry in "${probed[@]}"; do
+            IFS='|' read -r name preset repo tag size verified kb_tok extra note <<<"$entry"
+            need=$(awk -v w="$size" -v kb="$kb_tok" -v c="$ctx" 'BEGIN{printf "%.0f", (w + kb*1024*c + 1.5e9) * 1.1}')
+            if ((need <= budget)); then
+                FIT_NAME="$name" FIT_PRESET="$preset" FIT_REPO="$repo" FIT_TAG="$tag" FIT_SIZE="$size" FIT_VERIFIED="$verified"
+                FIT_CTX="$ctx" FIT_EXTRA="$extra" FIT_NOTE="$note" FIT_NEED="$need"
+                # A model already on disk that also fits at this context beats a download of
+                # a bigger one, unless --best asks for the best regardless.
+                if [[ -z "$best" && ! -f "$(model_file "$repo" "$tag")" ]]; then
+                    local alt
+                    for alt in "${probed[@]}"; do
+                        IFS='|' read -r name preset repo tag size verified kb_tok extra note <<<"$alt"
+                        [[ -f "$(model_file "$repo" "$tag")" ]] || continue
+                        need=$(awk -v w="$size" -v kb="$kb_tok" -v c="$ctx" 'BEGIN{printf "%.0f", (w + kb*1024*c + 1.5e9) * 1.1}')
+                        ((need <= budget)) || continue
+                        FIT_NOTE="$note; already on disk, chosen over $FIT_NAME (rerun with --best to prefer that)"
+                        FIT_NAME="$name" FIT_PRESET="$preset" FIT_REPO="$repo" FIT_TAG="$tag" FIT_SIZE="$size" FIT_VERIFIED="$verified"
+                        FIT_EXTRA="$extra" FIT_NEED="$need"
+                        break
+                    done
+                fi
+                return 0
+            fi
+        done
+    done
+    # Nothing fits even at the minimum context: take the smallest there and say so.
+    IFS='|' read -r name preset repo tag size verified kb_tok extra note <<<"${probed[-1]}"
+    FIT_NAME="$name" FIT_PRESET="$preset" FIT_REPO="$repo" FIT_TAG="$tag" FIT_SIZE="$size" FIT_VERIFIED="$verified"
+    FIT_CTX="$min_ctx" FIT_EXTRA="$extra" FIT_NOTE="$note (DOES NOT FIT the budget; expect swapping)"
+    FIT_NEED=$(awk -v w="$size" -v kb="$kb_tok" -v c="$min_ctx" 'BEGIN{printf "%.0f", (w + kb*1024*c + 1.5e9) * 1.1}')
+    return 1
+}
+
+echo "Checking model tags on Docker Hub (ai/ namespace)${offline:+ skipped: --offline}..."
+fit ladder_code 4096 || true
+code=("$FIT_NAME" "$FIT_PRESET" "$FIT_REPO" "$FIT_TAG" "$FIT_SIZE" "$FIT_VERIFIED" "$FIT_CTX" "$FIT_EXTRA" "$FIT_NOTE" "$FIT_NEED")
+fit ladder_digest 8192 || true
+digest=("$FIT_NAME" "$FIT_PRESET" "$FIT_REPO" "$FIT_TAG" "$FIT_SIZE" "$FIT_VERIFIED" "$FIT_CTX" "$FIT_EXTRA" "$FIT_NOTE" "$FIT_NEED")
+IFS='|' read -r e_name e_preset e_repo e_regex e_fallback e_kb e_gb e_extra e_note <<<"$embed_entry"
+read -r e_tag e_size e_verified < <(probe "$e_repo" "$e_regex" "$e_fallback")
+((e_size > 0)) || e_size=300000000
+
+
+# Threads.
+threads=$((physical - 2)); ((threads < 2)) && threads=2
+batch_threads=$physical
+nice_level=19
+
+code_file="$(model_file "${code[2]}" "${code[3]}")"
+digest_file="$(model_file "${digest[2]}" "${digest[3]}")"
+embed_file="$(model_file "$e_repo" "$e_tag")"
+
+show() { # show LABEL ARRAY_NAME FILE
+    local -n p="$2"
+    local state="to download ($(gb "${p[4]}") GB)"
+    [[ -f "$3" ]] && state="present"
+    echo "$1: ${p[0]}"
+    echo "  source ai/${p[2]}:${p[3]} ($([[ "${p[5]}" == yes ]] && echo verified on Docker Hub || echo "UNVERIFIED tag, check it exists")), $state"
+    echo "  context ${p[6]} tokens, needs about $(gb "${p[9]}") GB; ${p[8]}"
+}
+echo
+echo "Plan:"
+show "code (docgen)" code "$code_file"
+show "digest (clctl)" digest "$digest_file"
+echo "embed (clctl search): $e_name, ai/$e_repo:$e_tag, $([[ -f "$embed_file" ]] && echo present || echo "to download ($(gb "$e_size") GB)")"
+echo "threads: $threads generation, $batch_threads prompt (of $physical physical cores), nice $nice_level"
+[[ -n "$use_gpu" ]] && echo "GPU: all layers offloaded (-ngl 99)"
+needed_disk=0
+[[ -f "$code_file" ]] || needed_disk=$((needed_disk + ${code[4]}))
+[[ -f "$digest_file" ]] || needed_disk=$((needed_disk + ${digest[4]}))
+[[ -f "$embed_file" ]] || needed_disk=$((needed_disk + e_size))
+if ((needed_disk > disk_free)); then
+    echo "WARNING: downloads need $(gb "$needed_disk") GB but only $(gb "$disk_free") GB is free under $models_dir" >&2
+fi
+((${code[6]} >= 8192)) || echo "WARNING: docgen's prompts need at least 8k of context to hold a module; at ${code[6]} keep scopes to one or two files" >&2
+[[ -n "$wsl" ]] && echo "note: WSL — model files are read with --load-mode dio so the page cache does not grow the VM; leave llm-server's default"
+
+# docgen.yaml values that match the fitted context.
+code_ctx=${code[6]}
+max_response=$((code_ctx / 4)); ((max_response > 8000)) && max_response=8000
+max_source=$((code_ctx - max_response - 1500)); ((max_source < 1000)) && max_source=1000
+echo
+echo "docgen.yaml llm: section for this machine (max_source_toks + max_response_toks + prompt text must fit $code_ctx):"
+echo "  llm:"
+echo "    url: http://127.0.0.1:8081/v1"
+echo "    model: qwen3-coder"
+echo "    max_source_toks: $max_source"
+echo "    max_response_toks: $max_response"
+
+if [[ -n "$dry_run" ]]; then
+    echo
+    echo "Dry run: nothing written. Config would go to $config_file"
+    exit 0
+fi
+
+echo
+ask "Write this configuration to $config_file (llm-server reads it on every run)?" || { echo "Not written."; exit 0; }
+mkdir -p "$config_dir"
+[[ -f "$config_file" ]] && cp "$config_file" "$config_file.bak"
+{
+    echo "# Written by llm-fit on $(date -Iseconds) for $(hostname): $physical/$logical cores, $(gb "$mem_total") GB RAM${gpu_name:+, $gpu_name}."
+    echo "# Sourced by llm-server (set LLM_NO_FIT=1 to ignore). Edit freely; rerun llm-fit to regenerate (previous copy: env.bak)."
+    echo "export LLM_MODEL='$code_file'"
+    echo "export LLM_SOURCE='${code[2]}:${code[3]}'"
+    echo "export LLM_CTX=${code[6]}"
+    echo "export LLM_EXTRA='${code[7]}'"
+    echo "export LLM_DIGEST_MODEL='$digest_file'"
+    echo "export LLM_DIGEST_SOURCE='${digest[2]}:${digest[3]}'"
+    echo "export LLM_DIGEST_CTX=${digest[6]}"
+    echo "export LLM_DIGEST_EXTRA='${digest[7]}'"
+    echo "export LLM_EMBED_MODEL='$embed_file'"
+    echo "export LLM_EMBED_SOURCE='$e_repo:$e_tag'"
+    for prefix in LLM_ LLM_DIGEST_; do
+        echo "export ${prefix}THREADS=$threads"
+        echo "export ${prefix}BATCH_THREADS=$batch_threads"
+    done
+    echo "export LLM_NICE=$nice_level"
+    if [[ -n "$use_gpu" ]]; then
+        echo "export LLM_ARGS='-ngl 99'"
+        echo "export LLM_DIGEST_ARGS='-ngl 99'"
+        echo "export LLM_EMBED_ARGS='-ngl 99'"
+    fi
+} >"$config_file"
+echo "Wrote $config_file"
+
+if [[ -n "$download" ]]; then
+    here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    llm_server="$here/llm-server"; command -v llm-server >/dev/null && llm_server=llm-server
+    for preset in code digest embed; do
+        case "$preset" in
+        code) file="$code_file"; label="${code[0]} (ai/${code[2]}:${code[3]}, $(gb "${code[4]}") GB)" ;;
+        digest) file="$digest_file"; label="${digest[0]} (ai/${digest[2]}:${digest[3]}, $(gb "${digest[4]}") GB)" ;;
+        embed) file="$embed_file"; label="$e_name (ai/$e_repo:$e_tag, $(gb "$e_size") GB)" ;;
+        esac
+        [[ -f "$file" ]] && { echo "$preset: $file present"; continue; }
+        if ask "Download $preset model now: $label?"; then
+            "$llm_server" download "$preset" || echo "$preset download failed; rerun 'llm-server download $preset' to resume" >&2
+        else
+            echo "$preset: skipped; later: llm-server download $preset"
+        fi
+    done
+else
+    echo "Next: llm-server download code|digest|embed for anything marked 'to download' (or rerun with --download)."
+fi

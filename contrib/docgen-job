@@ -1,0 +1,468 @@
+#!/usr/bin/env bash
+# Nightly docgen run for a container (the lab cluster's docgen CronJob): builds docgen from
+# JB0t/docgen, clones each repository fresh, runs 'docgen draft --all' (redrafts only the
+# generated sections whose sources changed) and 'docgen check', and when draft changed
+# something pushes a docgen/<UTC date> branch and opens a GitLab MR or GitHub PR with the
+# check counts and the findings in the files it changed (at most max_findings; the full
+# report stays in the job log). It never pushes to a default branch and never runs 'check --fix':
+# hand-written text is not edited unattended. Needs bash, git, curl, python3 (JSON) and go,
+# all in the golang image; nothing is installed and no home state is assumed.
+#
+# Usage: docgen-job [--dry-run] [ENTRY ...]
+#   ENTRY       gitlab:<group/path> or github:<owner/repo>, optionally @<branch> (default:
+#               the project's default branch); default: the entries in DOCGEN_REPOS
+#   --dry-run   print the plan for each entry; clone, build, push and call nothing
+#   -h, --help
+#
+# Environment:
+#   DOCGEN_REPOS         entries separated by spaces or newlines ('#' starts a comment)
+#   GITLAB_TOKEN         api + write_repository, for gitlab: entries
+#   DOCGEN_LLM_API_KEY   optional: Bearer key for an inference gateway (passed through to docgen)
+#   DOCGEN_LLM_EMBED_URL, DOCGEN_LLM_EMBED_MODEL  optional: the embedding server (passed through)
+#   GITHUB_TOKEN         contents and pull requests read/write, for github: entries
+#   DOCGEN_LLM_URL       the model server, e.g. http://model-server:8080/v1 (required); docgen
+#   DOCGEN_LLM_MODEL     then neither starts nor stops it (required)
+#   DOCGEN_LLM_MAX_SOURCE_TOKS, DOCGEN_LLM_MAX_RESPONSE_TOKS, DOCGEN_LLM_START,
+#   DOCGEN_LLM_STOP      optional, passed to docgen (see docgen's README.md)
+#   DOCGEN_REF           branch or tag of github.com/JB0t/docgen to build (default main: the
+#                        latest release)
+#   MATTERMOST_WEBHOOK   incoming webhook for the summary (optional)
+#   GOPRIVATE            modules go fetches with git, not the proxy (default gitlab.com/example-org)
+#   DOCGEN_GO_TOKEN      GitLab token for those fetches (default GITLAB_TOKEN); read_repository
+#                        is enough, so a narrower token can be given here
+#   DOCGEN_WORKDIR       work directory, emptied per repository (default /work)
+#   GITLAB_URL           default https://gitlab.com
+#   GITHUB_URL, GITHUB_API  default https://github.com and https://api.github.com
+#
+# Tokens reach git only as an http.<host>.extraHeader in the environment of the one git
+# command that needs it (GIT_CONFIG_COUNT/KEY/VALUE), and curl only through a config read
+# from stdin: never in .git/config, a URL, a command line or the log. docgen itself runs
+# the repositories' CLIs (go run, for their --help) and go list, which may fetch private
+# modules from GitLab: it gets only that GitLab header (GIT_CONFIG_*), from DOCGEN_GO_TOKEN
+# when set, and none of the token variables, the GitHub token or the webhook.
+#
+# When an open docgen MR/PR from an earlier night exists for the same target branch:
+#   - if it already holds exactly tonight's generated files, nothing is pushed;
+#   - otherwise tonight's commit goes to a fresh branch with its own MR/PR, and the old
+#     one is closed, pointing at the new one (and its branch deleted) when every commit on
+#     it is docgen's: a comment on GitHub, the top of the description on GitLab (a
+#     fine-grained GitLab token has no MR-notes permission; Merge requests: Update closes and
+#     edits). One with commits by people is left open for its owner (on GitHub with a
+#     comment; on GitLab the job summary says so). Force-pushing the old branch instead would rewrite a branch
+#     a reviewer may have checked out or commented on line by line, and a "nobody touched
+#     it" check races a person pushing; a new branch loses nothing.
+#
+# Exit status: 0 when every entry succeeded or was skipped (no docgen.yaml); 1 when any
+# failed (clone, draft errors, push or API). 'docgen check' findings are reported in the
+# MR/PR, not counted as failures. No timeouts here: docgen's own (30 min per answer) apply.
+set -euo pipefail
+
+die() { echo "docgen-job: $*" >&2; exit 1; }
+
+dry_run="" entries=()
+while (($#)); do
+    case "$1" in
+    --dry-run) dry_run=1 ;;
+    -h | --help) sed -n '2,/^set -euo/{/^set -euo/d;s/^# \{0,1\}//;p}' "$0"; exit 0 ;;
+    -*) die "unknown option $1 (see --help)" ;;
+    *) entries+=("$1") ;;
+    esac
+    shift
+done
+if ((${#entries[@]} == 0)); then
+    set -f # entries are words, never globs
+    while IFS= read -r line; do
+        line="${line%%#*}"
+        for word in $line; do entries+=("$word"); done
+    done <<<"${DOCGEN_REPOS:-}"
+    set +f
+fi
+((${#entries[@]} > 0)) || die "no repositories: set DOCGEN_REPOS (gitlab:<group/path> or github:<owner/repo>, optionally @branch)"
+
+work="${DOCGEN_WORKDIR:-/work}"
+gitlab_url="${GITLAB_URL:-https://gitlab.com}" gitlab_url="${gitlab_url%/}"
+github_url="${GITHUB_URL:-https://github.com}" github_url="${github_url%/}"
+github_api="${GITHUB_API:-https://api.github.com}" github_api="${github_api%/}"
+docgen_ref="${DOCGEN_REF:-main}"
+date="$(date -u +%F)"
+author_name="docgen" author_email="docgen@localhost"
+max_findings=20 # check findings listed in the description; the job log has them all
+
+# parse ENTRY: sets kind, path, branch (empty: default branch) and slug, or fails.
+parse() {
+    local entry="$1"
+    kind="${entry%%:*}" path="${entry#*:}" branch=""
+    [[ "$entry" == *:* && ( "$kind" == gitlab || "$kind" == github ) ]] || return 1
+    if [[ "$path" == *@* ]]; then branch="${path#*@}" path="${path%%@*}"; fi
+    [[ -n "$path" && "$path" != /* && "$path" != */ && "$path" == */* ]] || return 1
+    [[ "$kind" == gitlab || "$path" != */*/* ]] || return 1
+    slug="$kind-${path//\//_}"
+}
+
+for entry in "${entries[@]}"; do
+    parse "$entry" || die "bad entry '$entry': want gitlab:<group/path> or github:<owner/repo>, optionally @branch"
+done
+
+if [[ -n "$dry_run" ]]; then
+    echo "docgen-job plan ($date, work directory $work):"
+    echo "  build docgen from $github_url/JB0t/docgen at $docgen_ref (scripts/install.sh $work/bin)"
+    echo "  model: ${DOCGEN_LLM_MODEL:-<DOCGEN_LLM_MODEL unset>} at ${DOCGEN_LLM_URL:-<DOCGEN_LLM_URL unset>} (checked on /models first)"
+    for entry in "${entries[@]}"; do
+        parse "$entry"
+        if [[ "$kind" == gitlab ]]; then url="$gitlab_url/$path.git" token=GITLAB_TOKEN review="MR"
+        else url="$github_url/$path.git" token=GITHUB_TOKEN review="PR"; fi
+        echo "  $entry:"
+        echo "    clone $url (${branch:-default branch}, depth 1) into $work/repos/$slug"
+        echo "    skip if it has no docgen.yaml; else docgen draft --all, then docgen check"
+        echo "    if draft changed files: commit as $author_name <$author_email>, push docgen/$date (or -2, -3, ...),"
+        echo "    open a $review against ${branch:-the default branch}, and supersede an open docgen $review from an earlier night"
+        [[ -n "${!token:-}" ]] || echo "    note: $token is not set; the real run would fail this entry"
+    done
+    [[ -n "${DOCGEN_LLM_URL:-}" && -n "${DOCGEN_LLM_MODEL:-}" ]] || echo "  note: DOCGEN_LLM_URL and DOCGEN_LLM_MODEL are required for the real run"
+    exit 0
+fi
+
+[[ -n "${DOCGEN_LLM_URL:-}" ]] || die "DOCGEN_LLM_URL is not set (the model server, e.g. http://model-server:8080/v1)"
+[[ -n "${DOCGEN_LLM_MODEL:-}" ]] || die "DOCGEN_LLM_MODEL is not set"
+for tool in git curl python3 go base64; do
+    command -v "$tool" >/dev/null || die "$tool is not on PATH"
+done
+
+# Nothing here may print a token: no tracing, git never asks for a password.
+unset GIT_TRACE GIT_TRACE_CURL GIT_CURL_VERBOSE GIT_ASKPASS SSH_ASKPASS
+export GIT_TERMINAL_PROMPT=0 GIT_CONFIG_NOSYSTEM=1
+mkdir -p "$work"
+work="$(cd "$work" && pwd)"
+[[ -n "${HOME:-}" && -d "$HOME" && -w "$HOME" ]] || export HOME="$work/home"
+mkdir -p "$HOME" "$work/repos" "$work/state"
+export GOCACHE="${GOCACHE:-$work/cache/go-build}" GOMODCACHE="${GOMODCACHE:-$work/cache/go-mod}"
+export GOFLAGS="${GOFLAGS:--modcacherw}" # so the module cache can be deleted like any directory
+export PATH="$work/bin:$PATH"
+
+# authenv KIND: sets the array auth to the environment that gives git KIND's token as an
+# HTTP header for that host only (empty without a token).
+authenv() {
+    local base user token
+    if [[ "$1" == gitlab ]]; then base="$gitlab_url" user=oauth2 token="${2-${GITLAB_TOKEN:-}}"
+    else base="$github_url" user=x-access-token token="${GITHUB_TOKEN:-}"; fi
+    auth=()
+    [[ -z "$token" ]] || auth=(GIT_CONFIG_COUNT=1 "GIT_CONFIG_KEY_0=http.$base/.extraHeader"
+        "GIT_CONFIG_VALUE_0=Authorization: Basic $(printf '%s:%s' "$user" "$token" | base64 -w0)")
+}
+
+# authgit KIND GIT-ARGS...: git with KIND's token (see authenv).
+authgit() {
+    local auth
+    authenv "$1"
+    shift
+    env "${auth[@]}" git "$@"
+}
+
+# api KIND METHOD PATH [BODY-FILE]: calls the GitLab or GitHub REST API; the reply goes
+# to $work/state/reply. Fails (printing the reply) on HTTP 400 and above.
+api() {
+    local kind="$1" method="$2" target="$3" body="${4:-}" url header status
+    if [[ "$kind" == gitlab ]]; then
+        url="$gitlab_url/api/v4$target" header="header = \"PRIVATE-TOKEN: ${GITLAB_TOKEN:-}\""
+    else
+        url="$github_api$target"
+        header="header = \"Authorization: Bearer ${GITHUB_TOKEN:-}\""$'\n''header = "Accept: application/vnd.github+json"'$'\n''header = "X-GitHub-Api-Version: 2022-11-28"'
+    fi
+    local args=(-sS -X "$method" -o "$work/state/reply" -w '%{http_code}' -K -)
+    [[ "$method" == GET ]] && args+=(--retry 3 --retry-delay 20) # 429 and 5xx; never a POST twice
+    [[ -n "$body" ]] && args+=(-H "Content-Type: application/json" --data-binary "@$body")
+    status="$(curl "${args[@]}" "$url" <<<"$header")" || status=000
+    if ((status >= 400 || status == 0)); then
+        echo "$method $url: HTTP $status: $(head -c 500 "$work/state/reply" 2>/dev/null)" >&2
+        return 1
+    fi
+}
+
+# json EXPR: evaluates a Python expression over the last reply (d) and prints the result:
+# a list prints one line per item, None prints nothing.
+json() {
+    python3 -I -c '
+import json, sys
+d = json.load(open(sys.argv[1]))
+value = eval(sys.argv[2])
+for item in (value if isinstance(value, list) else [] if value is None else [value]):
+    print(item)' "$work/state/reply" "$1"
+}
+
+# body FILE KEY=VALUE|KEY@FILE|KEY:=JSON...: writes a JSON object to FILE.
+body() {
+    python3 -I -c '
+import json, sys
+out = {}
+for arg in sys.argv[2:]:
+    for sep in (":=", "@", "="):
+        if sep in arg:
+            key, value = arg.split(sep, 1)
+            out[key] = json.loads(value) if sep == ":=" else open(value).read() if sep == "@" else value
+            break
+json.dump(out, open(sys.argv[1], "w"))' "$@"
+}
+
+# findings JSON FILES: the check findings in FILES (newline-separated paths), errors
+# first, at most max_findings, as Markdown for the MR/PR description. Findings elsewhere
+# were there before tonight's draft and are only counted: listing them buries the change.
+findings() {
+    python3 -I -c '
+import json, sys
+try:
+    found = json.load(open(sys.argv[1])) or []
+except (OSError, ValueError):
+    print("No findings list (docgen check --json failed; see the job log).")
+    sys.exit()
+files = set(sys.argv[2].splitlines())
+limit = int(sys.argv[3])
+here = [f for f in found if f.get("doc") in files]
+here.sort(key=lambda f: ({"error": 0, "warning": 1}.get(f.get("severity"), 2), f.get("doc", ""), f.get("line", 0)))
+if not here:
+    print("None of the %d finding(s) are in the files changed here." % len(found))
+    sys.exit()
+shown = here[:limit]
+print("%d of the %d finding(s) are in the files changed here%s:" % (len(here), len(found), "" if len(here) == len(shown) else "; the first %d" % len(shown)))
+print()
+print("```text")
+for f in shown:
+    print("%s:%s: %s: %s" % (f.get("doc"), f.get("line"), f.get("severity"), f.get("message")))
+print("```")' "$1" "$2" "$max_findings"
+}
+
+urlencode() { python3 -I -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' "$1"; }
+
+# run_docgen ARGS...: docgen without the token variables or the webhook. Its go run / go
+# list (clis: entries, facts) may fetch private modules (GOPRIVATE) over HTTPS from GitLab,
+# so git gets the GitLab read header the same way authgit passes it, and nothing else.
+run_docgen() {
+    local auth
+    authenv gitlab "${DOCGEN_GO_TOKEN:-${GITLAB_TOKEN:-}}"
+    env -u GITLAB_TOKEN -u GITHUB_TOKEN -u DOCGEN_GO_TOKEN -u MATTERMOST_WEBHOOK \
+        GOPRIVATE="${GOPRIVATE:-gitlab.com/example-org}" "${auth[@]}" docgen "$@"
+}
+
+step() { echo "-- $*"; printf '%s' "$*" >"$work/state/step"; }
+result() { printf '%s' "$*" >"$work/state/result"; }
+
+# process ENTRY: one repository, start to finish. Runs in a subshell with set -e.
+process() {
+    parse "$1"
+    local dir="$work/repos/$slug" url review project base
+    if [[ "$kind" == gitlab ]]; then
+        [[ -n "${GITLAB_TOKEN:-}" ]] || { result "FAILED: GITLAB_TOKEN is not set"; return 1; }
+        url="$gitlab_url/$path.git" review="MR" project="/projects/$(urlencode "$path")"
+    else
+        [[ -n "${GITHUB_TOKEN:-}" ]] || { result "FAILED: GITHUB_TOKEN is not set"; return 1; }
+        url="$github_url/$path.git" review="PR" project="/repos/$path"
+    fi
+
+    step "clone $url ${branch:-(default branch)}"
+    rm -rf "$dir"
+    # draft and check read files and markers only, never history: one commit is enough.
+    authgit "$kind" clone -q --depth 1 --single-branch ${branch:+--branch "$branch"} "$url" "$dir"
+    if [[ ! -f "$dir/docgen.yaml" ]]; then
+        result "skipped: no docgen.yaml"
+        rm -rf "$dir"
+        return 0
+    fi
+    base="$(git -C "$dir" symbolic-ref --short HEAD)"
+
+    step "docgen draft --all"
+    local draft_ok="" check_rc=0
+    (cd "$dir" && run_docgen draft --all) 2>&1 | tee "$work/state/draft.log" && draft_ok=1
+    step "docgen check"
+    (cd "$dir" && run_docgen check) >"$work/state/check.txt" 2>&1 || check_rc=$?
+    cat "$work/state/check.txt"
+    (cd "$dir" && run_docgen check --json) >"$work/state/check.json" 2>/dev/null || true
+    local check_line
+    check_line="$(grep -E '^[0-9]+ docs checked' "$work/state/check.txt" | tail -1 || true)"
+    ((check_rc <= 1)) || check_line="check failed (exit $check_rc)"
+    local outcome="draft had errors; check: ${check_line:-no summary}"
+    [[ -z "$draft_ok" ]] || outcome="draft ok; check: ${check_line:-no summary}"
+
+    step "stage"
+    # Tracked files draft rewrote, plus Markdown it created (a new module README); never
+    # untracked build output from running a repository's CLIs.
+    git -C "$dir" add -u
+    git -C "$dir" ls-files -z --others --exclude-standard -- '*.md' | xargs -0 -r git -C "$dir" add --
+    if git -C "$dir" diff --cached --quiet; then
+        result "no changes ($outcome)"
+        rm -rf "$dir"
+        [[ -n "$draft_ok" ]]
+        return
+    fi
+    local files file_list
+    files="$(git -C "$dir" diff --cached --name-only)"
+    mapfile -t file_list <<<"$files"
+    git -C "$dir" -c user.name="$author_name" -c user.email="$author_email" commit -q -m "docs: docgen draft"
+
+    step "look for open docgen ${review}s"
+    local olds=() line
+    if [[ "$kind" == gitlab ]]; then
+        api gitlab GET "$project/merge_requests?state=opened&target_branch=$(urlencode "$base")&per_page=100"
+        while IFS= read -r line; do [[ -n "$line" ]] && olds+=("$line"); done < <(json \
+            "[f\"{m['iid']} {m['source_branch']} {m['web_url']}\" for m in d if m['source_branch'].startswith('docgen/') and m['source_project_id'] == m['target_project_id']]")
+    else
+        api github GET "$project/pulls?state=open&base=$(urlencode "$base")&per_page=100"
+        while IFS= read -r line; do [[ -n "$line" ]] && olds+=("$line"); done < <(json \
+            "[f\"{p['number']} {p['head']['ref']} {p['html_url']}\" for p in d if p['head']['ref'].startswith('docgen/') and (p['head']['repo'] or {}).get('full_name', '').lower() == '${path,,}']")
+    fi
+    local old number old_branch old_url
+    for old in "${olds[@]}"; do
+        read -r number old_branch old_url <<<"$old"
+        authgit "$kind" -C "$dir" fetch -q --depth 1 origin "refs/heads/$old_branch"
+        if git -C "$dir" diff --quiet FETCH_HEAD HEAD -- "${file_list[@]}"; then
+            result "unchanged: $old_url already holds tonight's draft ($outcome)"
+            rm -rf "$dir"
+            [[ -n "$draft_ok" ]]
+            return
+        fi
+    done
+
+    step "push"
+    local taken new_branch="docgen/$date" n=2
+    taken="$(authgit "$kind" -C "$dir" ls-remote --heads origin 'refs/heads/docgen/*' | awk '{print $2}')"
+    while grep -qxF "refs/heads/$new_branch" <<<"$taken"; do new_branch="docgen/$date-$n" n=$((n + 1)); done
+    authgit "$kind" -C "$dir" push -q origin "HEAD:refs/heads/$new_branch"
+
+    step "open the $review"
+    local description="$work/state/description.md" request="$work/state/request.json" new_url
+    {
+        echo "Generated sections redrafted by \`docgen draft --all\` with \`$DOCGEN_LLM_MODEL\`. This $review was generated unattended by docgen-job (the nightly docgen CronJob); hand-written text is never edited unattended (no \`docgen check --fix\`)."
+        echo
+        echo "Draft: $(grep -E '^Done in ' "$work/state/draft.log" | tail -1 || echo "no summary (see the job log)")"
+        echo
+        echo "Changed files:"
+        sed 's/^/- `/; s/$/`/' <<<"$files"
+        echo
+        echo "## docgen check"
+        echo
+        echo "Check: ${check_line:-no summary}. The full report is in the job log; \`docgen check\` in the repository prints it."
+        echo
+        findings "$work/state/check.json" "$files"
+    } >"$description"
+    if [[ "$kind" == gitlab ]]; then
+        body "$request" source_branch="$new_branch" target_branch="$base" title="docs: docgen draft ($date)" \
+            description@"$description" remove_source_branch:=true
+        api gitlab POST "$project/merge_requests" "$request"
+        new_url="$(json 'd["web_url"]')"
+    else
+        body "$request" head="$new_branch" base="$base" title="docs: docgen draft ($date)" body@"$description"
+        api github POST "$project/pulls" "$request"
+        new_url="$(json 'd["html_url"]')"
+    fi
+    local summary
+    summary="opened $new_url ($(wc -l <<<"$files") file(s); $outcome)"
+    result "$summary"
+
+    for old in "${olds[@]}"; do
+        read -r number old_branch old_url <<<"$old"
+        step "supersede $old_url"
+        local others
+        if [[ "$kind" == gitlab ]]; then
+            api gitlab GET "$project/merge_requests/$number/commits?per_page=100"
+            others="$(json "[c['author_email'] for c in d if c['author_email'] != '$author_email']")"
+        else
+            api github GET "$project/pulls/$number/commits?per_page=100"
+            others="$(json "[c['commit']['author']['email'] for c in d if c['commit']['author']['email'] != '$author_email']")"
+        fi
+        if [[ -n "$others" ]]; then
+            # GitLab: no comment. A fine-grained token offers no MR-notes permission, so the job
+            # needs only Merge requests: Update; the summary (and the job log) says it was left.
+            if [[ "$kind" == github ]]; then
+                body "$request" body="docgen opened $new_url with tonight's draft. This one has commits by people, so it is left open for you to merge or close."
+                api github POST "$project/issues/$number/comments" "$request"
+            fi
+            summary="$summary; left $old_url open (commits by people)"
+        else
+            if [[ "$kind" == gitlab ]]; then
+                # The pointer goes at the top of the old MR's description, in the same call that
+                # closes it (Merge requests: Update), rather than in a comment (no such permission).
+                api gitlab GET "$project/merge_requests/$number"
+                json "d.get('description') or ''" >"$work/state/old-description"
+                printf '**Superseded by %s** (tonight'"'"'s docgen draft, from the current %s). Closed by docgen-job.\n\n' "$new_url" "$base" \
+                    | cat - "$work/state/old-description" >"$work/state/new-description"
+                body "$request" state_event=close description@"$work/state/new-description"
+                api gitlab PUT "$project/merge_requests/$number" "$request"
+                # Branches: Delete is optional for the token: without it the old branch stays.
+                if ! api gitlab DELETE "$project/repository/branches/$(urlencode "$old_branch")"; then
+                    summary="$summary; could not delete branch $old_branch (token lacks Branches: Delete?)"
+                fi
+            else
+                body "$request" body="Superseded by $new_url (tonight's docgen draft, from the current $base). Closed by docgen-job."
+                api github POST "$project/issues/$number/comments" "$request"
+                body "$request" state=closed
+                api github PATCH "$project/pulls/$number" "$request"
+                api github DELETE "$project/git/refs/heads/$old_branch"
+            fi
+            summary="$summary; closed $old_url"
+        fi
+        result "$summary"
+    done
+    rm -rf "$dir"
+    [[ -n "$draft_ok" ]] || { result "$summary; draft had errors (see the job log)"; return 1; }
+}
+
+started="$(date -u -Iseconds)"
+summary=() failed=0
+fail_all() { # fail_all REASON: every entry fails for the same reason, before any clone.
+    for entry in "${entries[@]}"; do summary+=("$entry: FAILED: $1"); done
+    failed=${#entries[@]}
+}
+
+echo "== docgen-job $started: ${#entries[@]} repositories, model $DOCGEN_LLM_MODEL at $DOCGEN_LLM_URL"
+echo "-- build docgen from JB0t/docgen $docgen_ref"
+src="$work/docgen-src"
+rm -rf "$src"
+# A public repository: cloned anonymously, with full history without file contents (the
+# tags give the version).
+if git clone -q --filter=blob:none --branch "$docgen_ref" "$github_url/JB0t/docgen.git" "$src" &&
+    XDG_DATA_HOME="$work/share" XDG_CONFIG_HOME="$work/config" "$src/scripts/install.sh" "$work/bin"; then
+    run_docgen --version
+    echo "-- model server"
+    if ! models="$(curl -sS --retry 3 --retry-delay 20 --retry-all-errors "${DOCGEN_LLM_URL%/}/models")"; then
+        fail_all "no model server at $DOCGEN_LLM_URL"
+    elif ! python3 -I -c '
+import json, sys
+ids = [m.get("id", "") for m in json.loads(sys.argv[1]).get("data", [])]
+want = sys.argv[2]
+sys.exit(0 if want in ids or want + ":latest" in ids or not ids else 1)' "$models" "$DOCGEN_LLM_MODEL"; then
+        fail_all "model $DOCGEN_LLM_MODEL is not served at $DOCGEN_LLM_URL ($models)"
+    fi
+else
+    fail_all "building docgen from JB0t/docgen $docgen_ref failed"
+fi
+
+if ((failed == 0)); then
+    for entry in "${entries[@]}"; do
+        echo "== $entry"
+        rm -f "$work/state/result" "$work/state/step"
+        set +e
+        (set -e; process "$entry")
+        status=$?
+        set -e
+        line="$(cat "$work/state/result" 2>/dev/null || true)"
+        if ((status != 0)); then
+            failed=$((failed + 1))
+            if [[ -z "$line" ]]; then line="FAILED during $(cat "$work/state/step" 2>/dev/null || echo setup)"
+            elif [[ "$line" != FAILED* ]]; then line="FAILED: $line"; fi
+        fi
+        summary+=("$entry: $line")
+    done
+fi
+
+echo "== summary $started"
+printf '%s\n' "${summary[@]}"
+echo "${#entries[@]} repositories, $failed failed"
+if [[ -n "${MATTERMOST_WEBHOOK:-}" ]]; then
+    text="$work/state/webhook.json"
+    {
+        echo "#### docgen nightly $date: ${#entries[@]} repositories, $failed failed"
+        printf -- '- %s\n' "${summary[@]}"
+    } >"$work/state/webhook.md"
+    body "$text" text@"$work/state/webhook.md"
+    curl -sS -o /dev/null -K - -H "Content-Type: application/json" --data-binary "@$text" <<<"url = \"$MATTERMOST_WEBHOOK\"" ||
+        echo "docgen-job: posting the summary to Mattermost failed" >&2
+fi
+((failed == 0))

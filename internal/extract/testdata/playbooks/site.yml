@@ -1,0 +1,13 @@
+---
+# Deploys the web role: a play with roles only (no tasks:), as many deploy playbooks are.
+- name: Deploy web
+  hosts: web
+  roles:
+    - web
+
+- name: Check web
+  hosts: web
+  pre_tasks:
+    - name: Wait for the web port
+      ansible.builtin.wait_for:
+        port: 80

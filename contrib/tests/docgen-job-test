@@ -1,0 +1,233 @@
+#!/usr/bin/env bash
+# Tests contrib/docgen-job without a network, a model or a Go build: the "remotes" are bare
+# repositories behind file:// URLs (real git), and fake go, docgen and curl on PATH stand
+# in for the build, the model and the GitLab/GitHub/Mattermost APIs.
+# Usage: contrib/tests/docgen-job-test   (needs bash, git, python3; prints ok or the failures)
+set -euo pipefail
+
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+job="$here/../docgen-job"
+tmp="$(mktemp -d)"
+trap 'rm -rf "$tmp"' EXIT
+today="$(date -u +%F)"
+failures=0
+fail() { echo "FAIL: $*"; failures=$((failures + 1)); }
+expect() { grep -qF -- "$2" "$1" || fail "$1 lacks: $2"; }
+reject() { ! grep -qF -- "$2" "$1" || fail "$1 has: $2"; }
+
+bash -n "$job" || fail "bash -n"
+
+# --- fakes -------------------------------------------------------------------------------
+mkdir -p "$tmp/fake" "$tmp/log"
+cat >"$tmp/fake/go" <<'EOF'
+#!/usr/bin/env bash
+# go build ... -o OUT .: installs the fake docgen.
+while (($#)); do [[ "$1" == -o ]] && { cp "$FAKE_DIR/docgen" "$2"; chmod +x "$2"; exit 0; }; shift; done
+exit 1
+EOF
+cat >"$tmp/fake/docgen" <<'EOF'
+#!/usr/bin/env bash
+if [[ "$1" == draft || "$1" == check ]]; then # the job runs these; an installer may run completion
+    env | grep -E '^(GITLAB_TOKEN|GITHUB_TOKEN|DOCGEN_GO_TOKEN|MATTERMOST_WEBHOOK)=' >>"$FAKE_LOG/docgen-env" || true
+    echo "$GOPRIVATE $GIT_CONFIG_COUNT $GIT_CONFIG_KEY_0 $GIT_CONFIG_VALUE_0" >>"$FAKE_LOG/docgen-git"
+fi
+case "$1" in
+--version) echo "docgen version test" ;;
+completion) echo "# completion" ;;
+draft)
+    grep -q 'fake: fail' docgen.yaml && { echo "error: model server returned HTTP 500" >&2; exit 1; }
+    grep -q 'fake: nochange' docgen.yaml || echo "generated overview of $(basename "$PWD")" >>README.md
+    mkdir -p build && echo binary >build/out   # untracked output that must not be committed
+    echo "Done in 3s: 1 written, 0 up to date, 0 failed." >&2 ;;
+check)
+    if [[ "${2:-}" == --json ]]; then
+        echo '[{"doc":"README.md","line":1,"severity":"warning","kind":"symbol","ref":"nothing","message":"`nothing` appears nowhere in the code"},'
+        echo ' {"doc":"docs/OLD.md","line":7,"severity":"error","kind":"path","ref":"gone/","message":"path gone/ does not exist"}]'
+    else
+        echo "README.md:1: warning: \`nothing\` appears nowhere in the code"
+        echo "docs/OLD.md:7: error: path gone/ does not exist"
+        echo "2 docs checked: 1 errors, 1 warnings"
+    fi
+    exit 0 ;;
+esac
+EOF
+cat >"$tmp/fake/curl" <<'EOF'
+#!/usr/bin/env bash
+# Logs "METHOD URL auth?" per call and answers like GitLab, GitHub or Ollama would.
+printf '%s\n' "$*" >>"$FAKE_LOG/curl-argv"
+method=GET out="" url="" data="" config="" write=""
+while (($#)); do
+    case "$1" in
+    -X) method="$2"; shift ;;
+    -o) out="$2"; shift ;;
+    -K) [[ "$2" == - ]] && config="$(cat)"; shift ;;
+    --data-binary) data="${2#@}"; method="${method/GET/POST}"; shift ;;
+    -w) write=1; shift ;;
+    -H | --retry | --retry-delay) shift ;;
+    http* | file*) url="$1" ;;
+    esac
+    shift
+done
+[[ -z "$url" ]] && url="$(sed -n 's/^url = "\(.*\)"$/\1/p' <<<"$config")"
+auth=noauth
+grep -q 'test-gitlab-secret\|test-github-secret' <<<"$config" && auth=auth
+echo "$method $url $auth" >>"$FAKE_LOG/calls"
+[[ -n "$data" ]] && cp "$data" "$FAKE_LOG/body-$(wc -l <"$FAKE_LOG/calls")"
+reply='{}' code=200
+case "$method $url" in
+*/v1/models) reply='{"object":"list","data":[{"id":"test-model:latest","object":"model"}]}' ;;
+"GET "*grp%2Falpha/merge_requests\?state=opened*) reply='[{"iid":5,"source_branch":"docgen/2026-10-01","web_url":"https://gitlab.test/grp/alpha/-/merge_requests/5","source_project_id":1,"target_project_id":1},{"iid":4,"source_branch":"feature/x","web_url":"u","source_project_id":1,"target_project_id":1}]' ;;
+"GET "*grp%2Feps/merge_requests\?state=opened*) reply='[{"iid":9,"source_branch":"docgen/2026-10-02","web_url":"https://gitlab.test/grp/eps/-/merge_requests/9","source_project_id":2,"target_project_id":2}]' ;;
+"GET "*/merge_requests\?state=opened*) reply='[]' ;;
+"GET "*/merge_requests/5/commits*) reply='[{"author_email":"docgen@localhost"}]' ;;
+"GET "*/merge_requests/5) reply='{"iid":5,"description":"Last night'"'"'s report."}' ;;
+"POST "*/merge_requests) reply='{"iid":6,"web_url":"https://gitlab.test/grp/alpha/-/merge_requests/6"}'; code=201 ;;
+"GET "*/pulls\?state=open*) reply='[]' ;;
+"POST "*/pulls) reply='{"number":3,"html_url":"https://github.test/JB0t/gamma/pull/3"}'; code=201 ;;
+esac
+if [[ -n "$out" ]]; then printf '%s' "$reply" >"$out"; else printf '%s' "$reply"; fi
+[[ -z "$write" ]] || printf '%s' "$code"
+EOF
+chmod +x "$tmp/fake/"*
+
+# --- remotes -----------------------------------------------------------------------------
+git_q() { git -c user.name=t -c user.email=t@example.com -c init.defaultBranch=main "$@"; }
+# remote URL-ROOT PATH [docgen.yaml text]: a bare repository with one commit on main.
+remote() {
+    local bare="$tmp/$1/$2.git" src="$tmp/src/$1/$2"
+    mkdir -p "$src" && git_q init -q "$src"
+    echo "# $(basename "$2")" >"$src/README.md"
+    [[ $# -ge 3 ]] && printf '%s\n' "$3" >"$src/docgen.yaml"
+    git_q -C "$src" add -A && git_q -C "$src" commit -q -m init
+    mkdir -p "$(dirname "$bare")" && git_q clone -q --bare "$src" "$bare"
+    git -C "$bare" config uploadpack.allowFilter true
+}
+# JB0t/docgen: the job clones it and runs its scripts/install.sh (a stand-in here that
+# builds with the fake go).
+remote github JB0t/docgen
+mkdir -p "$tmp/src/github/JB0t/docgen/scripts"
+cat >"$tmp/src/github/JB0t/docgen/scripts/install.sh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+cd "$(dirname "$0")/.." && go build -o "$1/docgen" .
+EOF
+chmod +x "$tmp/src/github/JB0t/docgen/scripts/install.sh"
+echo "package main" >"$tmp/src/github/JB0t/docgen/main.go"
+git_q -C "$tmp/src/github/JB0t/docgen" add -A && git_q -C "$tmp/src/github/JB0t/docgen" commit -q -m docgen &&
+    git_q -C "$tmp/src/github/JB0t/docgen" tag v1.2.3 &&
+    git_q -C "$tmp/src/github/JB0t/docgen" push -q --tags "$tmp/github/JB0t/docgen.git" main
+remote gitlab grp/alpha "exclude: []"
+remote gitlab grp/sub/beta # no docgen.yaml
+remote github JB0t/gamma "exclude: []"
+remote gitlab grp/delta "fake: fail"
+remote gitlab grp/quiet "fake: nochange"
+remote gitlab grp/eps "exclude: []"
+# gamma already has tonight's branch name taken; alpha and eps have older docgen branches,
+# eps's holding exactly what tonight's draft writes.
+git_q -C "$tmp/src/github/JB0t/gamma" push -q "$tmp/github/JB0t/gamma.git" "main:refs/heads/docgen/$today"
+git_q -C "$tmp/src/gitlab/grp/alpha" push -q "$tmp/gitlab/grp/alpha.git" "main:refs/heads/docgen/2026-10-01"
+(cd "$tmp/src/gitlab/grp/eps" && echo "generated overview of gitlab-grp_eps" >>README.md && git_q commit -qam old &&
+    git_q push -q "$tmp/gitlab/grp/eps.git" "HEAD:refs/heads/docgen/2026-10-02")
+main_before="$(for r in gitlab/grp/alpha github/JB0t/gamma gitlab/grp/eps; do git -C "$tmp/$r.git" rev-parse main; done)"
+
+# --- dry run -----------------------------------------------------------------------------
+env -i PATH="$tmp/fake:/usr/bin:/bin" DOCGEN_REPOS=$'gitlab:grp/alpha\n  github:JB0t/gamma@dev # comment' \
+    bash "$job" --dry-run >"$tmp/log/dry" 2>&1 || fail "--dry-run exited $?"
+expect "$tmp/log/dry" "clone https://gitlab.com/grp/alpha.git (default branch, depth 1)"
+expect "$tmp/log/dry" "clone https://github.com/JB0t/gamma.git (dev, depth 1)"
+expect "$tmp/log/dry" "note: GITLAB_TOKEN is not set"
+expect "$tmp/log/dry" "DOCGEN_LLM_URL and DOCGEN_LLM_MODEL are required"
+[[ ! -e "$tmp/log/calls" ]] || fail "--dry-run called curl"
+env -i PATH=/usr/bin:/bin bash "$job" --dry-run "gitlab:noslash" >/dev/null 2>&1 && fail "bad entry accepted"
+env -i PATH=/usr/bin:/bin bash "$job" --dry-run "github:a/b/c" >/dev/null 2>&1 && fail "github entry with three parts accepted"
+env -i PATH=/usr/bin:/bin bash "$job" --help | grep -q '^Usage: docgen-job' || fail "--help"
+
+# --- real run ----------------------------------------------------------------------------
+status=0
+env -i PATH="$tmp/fake:/usr/bin:/bin" FAKE_DIR="$tmp/fake" FAKE_LOG="$tmp/log" \
+    DOCGEN_REPOS="gitlab:grp/alpha gitlab:grp/sub/beta github:JB0t/gamma gitlab:grp/delta gitlab:grp/missing gitlab:grp/quiet gitlab:grp/eps" \
+    GITLAB_URL="file://$tmp/gitlab" GITHUB_URL="file://$tmp/github" GITHUB_API="https://api.github.test" \
+    GITLAB_TOKEN=test-gitlab-secret GITHUB_TOKEN=test-github-secret DOCGEN_GO_TOKEN=test-read-secret MATTERMOST_WEBHOOK="https://chat.test/hooks/test-hook-secret" \
+    DOCGEN_LLM_URL="http://ollama.test:11435/v1" DOCGEN_LLM_MODEL=test-model DOCGEN_WORKDIR="$tmp/work" \
+    bash "$job" >"$tmp/log/run" 2>&1 || status=$?
+out="$tmp/log/run"
+((status == 1)) || fail "exit status $status, want 1 (delta and missing fail)"
+expect "$out" "docgen version test"
+expect "$out" "gitlab:grp/alpha: opened https://gitlab.test/grp/alpha/-/merge_requests/6 (1 file(s); draft ok; check: 2 docs checked: 1 errors, 1 warnings); closed https://gitlab.test/grp/alpha/-/merge_requests/5"
+expect "$out" "gitlab:grp/sub/beta: skipped: no docgen.yaml"
+expect "$out" "github:JB0t/gamma: opened https://github.test/JB0t/gamma/pull/3"
+expect "$out" "gitlab:grp/delta: FAILED: no changes (draft had errors;"
+expect "$out" "gitlab:grp/missing: FAILED during clone"
+expect "$out" "gitlab:grp/quiet: no changes (draft ok;"
+expect "$out" "gitlab:grp/eps: unchanged: https://gitlab.test/grp/eps/-/merge_requests/9 already holds tonight's draft"
+expect "$out" "7 repositories, 2 failed"
+for secret in test-gitlab-secret test-github-secret test-read-secret test-hook-secret; do
+    reject "$out" "$secret"
+    reject "$tmp/log/curl-argv" "$secret"
+done
+[[ ! -s "$tmp/log/docgen-env" ]] || fail "docgen saw: $(cut -d= -f1 "$tmp/log/docgen-env" | sort -u | tr '\n' ' ')"
+# docgen's go fetches get the read token (DOCGEN_GO_TOKEN over GITLAB_TOKEN) for GitLab only.
+expect "$tmp/log/docgen-git" "gitlab.com/example-org 1 http.file://$tmp/gitlab/.extraHeader Authorization: Basic $(printf oauth2:test-read-secret | base64 -w0)"
+reject "$tmp/log/docgen-git" "$(printf oauth2:test-gitlab-secret | base64 -w0)"
+grep -rlsF test-g "$tmp/work" && fail "a token was written under the work directory"
+
+# Branches: new ones pushed, defaults untouched, the commit is docgen's and holds docs only.
+git -C "$tmp/gitlab/grp/alpha.git" rev-parse -q --verify "refs/heads/docgen/$today" >/dev/null || fail "alpha: no docgen/$today"
+git -C "$tmp/github/JB0t/gamma.git" rev-parse -q --verify "refs/heads/docgen/$today-2" >/dev/null || fail "gamma: no docgen/$today-2"
+git -C "$tmp/gitlab/grp/eps.git" rev-parse -q --verify "refs/heads/docgen/$today" >/dev/null && fail "eps: pushed although unchanged"
+[[ "$(for r in gitlab/grp/alpha github/JB0t/gamma gitlab/grp/eps; do git -C "$tmp/$r.git" rev-parse main; done)" == "$main_before" ]] || fail "a default branch moved"
+commit="$(git -C "$tmp/gitlab/grp/alpha.git" log -1 --format='%an <%ae>|%cn <%ce>|%s' "docgen/$today")"
+[[ "$commit" == "docgen <docgen@localhost>|docgen <docgen@localhost>|docs: docgen draft" ]] || fail "commit: $commit"
+[[ "$(git -C "$tmp/gitlab/grp/alpha.git" diff --name-only main "docgen/$today")" == README.md ]] || fail "commit holds more than README.md"
+
+# API calls: MR with the report, old MR closed and its branch deleted, PR, webhook.
+calls="$tmp/log/calls"
+expect "$calls" "GET file://$tmp/gitlab/api/v4/projects/grp%2Falpha/merge_requests?state=opened&target_branch=main&per_page=100 auth"
+expect "$calls" "PUT file://$tmp/gitlab/api/v4/projects/grp%2Falpha/merge_requests/5 auth"
+expect "$calls" "DELETE file://$tmp/gitlab/api/v4/projects/grp%2Falpha/repository/branches/docgen%2F2026-10-01 auth"
+# GitLab: no MR notes (a fine-grained token has no such permission); the pointer goes at the top
+# of the closed MR's description, above what it said before.
+if grep -q "/notes" "$calls"; then echo "FAIL: a GitLab MR note was posted" >&2; exit 1; fi
+grep -l '"state_event": "close"' "$tmp/log"/body-* | xargs grep -q 'Superseded by https://gitlab.test/grp/alpha/-/merge_requests/6.*Last night' \
+    || { echo "FAIL: the closed MR's description does not point at the new one" >&2; exit 1; }
+expect "$calls" "POST https://api.github.test/repos/JB0t/gamma/pulls auth"
+expect "$calls" "POST https://chat.test/hooks/test-hook-secret noauth"
+reject "$calls" "merge_requests/4"
+mr="$(grep -l '"source_branch": "docgen/' "$tmp/log"/body-* | head -1)"
+[[ -n "$mr" ]] || fail "no MR request body"
+python3 -I - "$mr" "$today" <<'EOF' || fail "MR body"
+import json, sys
+body = json.load(open(sys.argv[1]))
+assert body["source_branch"] == "docgen/" + sys.argv[2] and body["target_branch"] == "main", body
+assert body["remove_source_branch"] is True and body["title"] == "docs: docgen draft (%s)" % sys.argv[2], body
+assert "generated unattended" in body["description"] and "2 docs checked: 1 errors, 1 warnings" in body["description"], body
+# Only findings in the changed files are listed; the rest are counted.
+assert "1 of the 2 finding(s) are in the files changed here" in body["description"], body
+assert "README.md:1: warning:" in body["description"] and "docs/OLD.md" not in body["description"], body
+assert "`README.md`" in body["description"] and "test-model" in body["description"], body
+EOF
+pr="$(grep -l '"head": "docgen/' "$tmp/log"/body-* | head -1)"
+[[ -n "$pr" ]] && python3 -I -c 'import json,sys; b=json.load(open(sys.argv[1])); assert b["head"].endswith("-2") and b["base"]=="main" and "unattended" in b["body"], b' "$pr" ||
+    fail "PR body"
+close="$(grep -l '"state_event": "close"' "$tmp/log"/body-* | head -1)"
+[[ -n "$close" ]] || fail "old MR not closed"
+grep -lqF "Superseded by https://gitlab.test/grp/alpha/-/merge_requests/6" "$tmp/log"/body-* || fail "no superseded note"
+hook="$(grep -l '"text": "#### docgen nightly' "$tmp/log"/body-* | head -1)"
+[[ -n "$hook" ]] || fail "no webhook body"
+
+# Model server without the model: every entry fails, nothing is cloned.
+: >"$tmp/log/calls"
+status=0
+env -i PATH="$tmp/fake:/usr/bin:/bin" FAKE_DIR="$tmp/fake" FAKE_LOG="$tmp/log" GITHUB_URL="file://$tmp/github" \
+    DOCGEN_LLM_URL="http://ollama.test:11435/v1" DOCGEN_LLM_MODEL=other-model DOCGEN_WORKDIR="$tmp/work2" \
+    GITLAB_TOKEN=x bash "$job" gitlab:grp/alpha >"$tmp/log/run2" 2>&1 || status=$?
+((status == 1)) || fail "missing model: exit $status"
+expect "$tmp/log/run2" "gitlab:grp/alpha: FAILED: model other-model is not served"
+[[ ! -d "$tmp/work2/repos/gitlab-grp_alpha" ]] || fail "missing model: cloned anyway"
+
+if ((failures)); then
+    echo "--- last run:"; cat "$out"
+    echo "$failures failure(s)"
+    exit 1
+fi
+echo ok

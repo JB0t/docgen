@@ -1,0 +1,473 @@
+#!/usr/bin/env bash
+# Starts, stops and reports on local llama.cpp model servers, one per preset.
+# Each serves an OpenAI-compatible API (http://127.0.0.1:<port>/v1) on localhost only.
+#
+# Usage: llm-server start|stop|status|log|download [PRESET]
+#        llm-server completion [--install]   bash tab completion (--install: into
+#                                            ~/.local/share/bash-completion/completions)
+#
+# Presets (PRESET defaults to code; stop and status without one cover every preset):
+#   code    docgen's coding model             qwen3-coder     port 8081  32k context
+#   digest  clctl's comment summaries          qwen3-instruct  port 8082  16k context
+#           (Qwen3-30B-A3B-Instruct-2507 Q8_0: general instructions, not code,
+#           no thinking blocks; 3B active parameters, so as fast on a CPU as the coder)
+#   embed   clctl's search embeddings          nomic-embed-text port 8083  2k context
+#           (small: runs alongside either model)
+# code and digest each need about 33 GB of RAM at Q8, so only one runs at a time:
+# starting one while the other runs fails unless LLM_ALLOW_BOTH=1.
+#
+# 'download PRESET' fetches the preset's default model from Docker Hub's ai/ namespace
+# (SOURCE below). Docker Engine cannot pull these model artifacts, so the GGUF file is
+# read straight from the registry's blob layer: nothing is stored as an image, so there
+# is nothing to clean up. The download is capped at LLM_DOWNLOAD_RATE MB/s (default 50),
+# written pages are flushed out of the page cache every 64 MB (on WSL the cache grows
+# the VM's memory), and the file is checked against the layer's sha256. An interrupted
+# download resumes from its .part file. HTTPS_PROXY is honoured.
+#
+# Defaults are gentle so a long batch cannot starve the rest of the machine: fewer
+# threads than cores, and the server runs at the lowest CPU and I/O priority.
+# LLM_PROFILE=fast uses more cores for the fastest runs (about 25% quicker but hotter).
+# LLM_PROFILE=low is for a machine that must stay usable (or a small WSL VM): at most 4
+# threads, small batches and at most an 8k context (what clctl needs), so it is slower
+# but holds less memory and CPU at once; it caps llm-fit's settings too.
+#
+# Before loading, start checks that the model and its context fit in the memory free
+# right now and refuses otherwise: running out while loading can take a WSL VM down.
+# LLM_NO_MEMORY_CHECK=1 skips the check (it is skipped anyway with -ngl GPU offload).
+#
+# Settings (environment). The code preset reads LLM_<NAME>, the others
+# LLM_DIGEST_<NAME> and LLM_EMBED_<NAME>, so a coding-model override in your profile
+# never leaks into the digest server:
+#   LLM_SERVER   llama-server binary         (newest under ~/.local/opt/llama.cpp)
+#   ..._MODEL    GGUF file                   (under ~/.local/share/llm/models)
+#   ..._SOURCE   Docker Hub ai/ model for download, REPO:TAG
+#   ..._ALIAS    model name served
+#   ..._PORT     port
+#   ..._CTX      context window in tokens
+#   ..._THREADS  threads for generation      (code/digest: gentle 10, fast 12; embed 4)
+#   ..._BATCH_THREADS threads for prompts    (code/digest: gentle 12, fast 14; embed 4)
+#   ..._EXTRA    replaces the preset's llama-server flags; ..._ARGS appends (e.g. -ngl 99)
+# 'llm-fit' discovers the machine and writes all of these for it to
+# ${XDG_CONFIG_HOME:-~/.config}/llm-server/env, which this script sources (LLM_NO_FIT=1 skips).
+#   LLM_PROFILE  gentle (default), fast or low
+#   LLM_NICE     CPU priority, 0-19          (19: lowest)
+#   LLM_DOWNLOAD_RATE  download cap in MB/s  (50)
+set -euo pipefail
+
+# Machine-fitted settings written by llm-fit (model, context, threads, GPU offload per preset);
+# the environment still wins because the file only sets what is not already set... except that
+# it uses plain exports, so an explicit variable in your shell must be exported AFTER sourcing:
+# set LLM_NO_FIT=1 to ignore the file entirely.
+FIT_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/llm-server/env"
+if [[ -z "${LLM_NO_FIT:-}" && -f "$FIT_FILE" ]]; then
+    # shellcheck disable=SC1090
+    source "$FIT_FILE"
+fi
+
+MODELS="$HOME/.local/share/llm/models"
+STATE="$HOME/.local/state"
+PRESETS=(code digest embed)
+LLM_SERVER="${LLM_SERVER:-$( (ls -d "$HOME"/.local/opt/llama.cpp/llama-b*/llama-server 2>/dev/null || true) | sort -V | tail -1)}"
+LLM_PROFILE="${LLM_PROFILE:-gentle}"
+LLM_NICE="${LLM_NICE:-19}"
+
+# preset NAME: sets MODEL ALIAS PORT CTX THREADS BATCH_THREADS BATCH EXTRA SOURCE LOG
+# from the preset's defaults and its environment overrides.
+preset() {
+    local prefix threads=10 batch_threads=12 batch=512
+    if [[ "$LLM_PROFILE" == fast ]]; then
+        threads=12 batch_threads=14 batch=2048
+    fi
+    case "$1" in
+    code)
+        prefix=LLM_
+        MODEL="$MODELS/qwen3-coder-30b-a3b-q4_K_M.gguf" ALIAS=qwen3-coder PORT=8081 CTX=32768
+        SOURCE=qwen3-coder:30b-a3b-q4_K_M
+        EXTRA=(--jinja -fa on --cache-type-k q8_0 --cache-type-v q8_0)
+        LOG="$STATE/llm-server.log"
+        ;;
+    digest)
+        prefix=LLM_DIGEST_
+        MODEL="$MODELS/qwen3-30b-a3b-instruct-2507-q8_0.gguf" ALIAS=qwen3-instruct PORT=8082 CTX=16384
+        SOURCE=qwen3:30b-a3b-instruct-2507-q8_0
+        # Qwen's recommended sampling for this model, for clients that do not set their
+        # own (clctl asks for temperature 0 so cached summaries stay reproducible).
+        EXTRA=(--jinja -fa on --cache-type-k q8_0 --cache-type-v q8_0
+            --temp 0.7 --top-p 0.8 --top-k 20 --min-p 0)
+        LOG="$STATE/llm-server-digest.log"
+        ;;
+    embed)
+        prefix=LLM_EMBED_
+        MODEL="$MODELS/nomic-embed-text-v1.5.f16.gguf" ALIAS=nomic-embed-text PORT=8083 CTX=2048
+        SOURCE=nomic-embed-text-v1.5:latest
+        threads=4 batch_threads=4 batch=2048 # a whole chunk must fit one batch
+        EXTRA=(--embeddings --pooling mean -fa auto)
+        LOG="$STATE/llm-server-embed.log"
+        ;;
+    *)
+        echo "unknown preset '$1' (use: ${PRESETS[*]})" >&2
+        exit 2
+        ;;
+    esac
+    local name
+    for name in MODEL ALIAS PORT CTX SOURCE; do
+        local override="${prefix}${name}"
+        [[ -n "${!override:-}" ]] && printf -v "$name" '%s' "${!override}"
+    done
+    local override="${prefix}THREADS"
+    THREADS="${!override:-$threads}"
+    override="${prefix}BATCH_THREADS"
+    BATCH_THREADS="${!override:-$batch_threads}"
+    BATCH="$batch"
+    if [[ "$LLM_PROFILE" == low ]]; then
+        # Caps rather than defaults, so they also hold against llm-fit's env file.
+        THREADS=$((THREADS < 4 ? THREADS : 4))
+        BATCH_THREADS=$((BATCH_THREADS < 4 ? BATCH_THREADS : 4))
+        BATCH=$((BATCH < 256 ? BATCH : 256))
+        [[ "$1" != embed ]] && CTX=$((CTX < 8192 ? CTX : 8192))
+    fi
+    # ..._EXTRA replaces the preset's llama-server flags, ..._ARGS appends to them (llm-fit
+    # writes "-ngl 99" there when the GPU is usable).
+    override="${prefix}EXTRA"
+    if [[ -n "${!override:-}" ]]; then
+        read -r -a EXTRA <<<"${!override}"
+    fi
+    override="${prefix}ARGS"
+    if [[ -n "${!override:-}" ]]; then
+        local -a more
+        read -r -a more <<<"${!override}"
+        EXTRA+=("${more[@]}")
+    fi
+}
+
+# memory_fits: whether the model file plus its context's KV cache and working buffers
+# fit in the memory available now. The model is read with --load-mode dio, so all of it
+# must fit: the page cache cannot give way. KV at q8_0 is taken as 110 KB per token of
+# context (Qwen3-30B-A3B: 48 layers x 2 x 4 KV heads x 128 x 1.07 bytes), plus 1.5 GB.
+memory_fits() {
+    [[ -n "${LLM_NO_MEMORY_CHECK:-}" ]] && return 0
+    local arg
+    for arg in "${EXTRA[@]}"; do
+        [[ "$arg" == -ngl || "$arg" == --n-gpu-layers || "$arg" == --gpu-layers ]] && return 0
+    done
+    local model_kb need_kb avail_kb
+    model_kb=$(($(stat -c %s "$MODEL") / 1024))
+    need_kb=$((model_kb + CTX * 110 + 1536 * 1024))
+    avail_kb=$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo)
+    if ((avail_kb < need_kb)); then
+        awk -v a="$ALIAS" -v n="$need_kb" -v m="$model_kb" -v c="$CTX" -v f="$avail_kb" 'BEGIN {
+            printf "%s needs about %.1f GB free (model %.1f GB + %d-token context); only %.1f GB is.\n",
+                a, n / 1048576, m / 1048576, c, f / 1048576 }' >&2
+        echo "Close other programs, give WSL more memory (.wslconfig memory=), or try LLM_PROFILE=low" \
+            "(8k context). A smaller model (llm-fit, or a q4_k_m file) fits too but writes worse summaries." >&2
+        return 1
+    fi
+}
+
+healthy() { curl -sf "http://127.0.0.1:$PORT/health" 2>/dev/null | grep -q '"ok"'; }
+# server_pid: the llama-server listening on this preset's port, if any.
+server_pid() { pgrep -f "llama-server .*--port $PORT( |$)" | head -1 || true; }
+
+# heavy_running NAME: prints another running chat preset (code or digest), if any.
+heavy_running() {
+    local other
+    for other in code digest; do
+        [[ "$other" == "$1" ]] && continue
+        (preset "$other"; [[ -n "$(server_pid)" ]]) && { echo "$other"; return; }
+    done
+    return 0
+}
+
+start() {
+    preset "$1"
+    if healthy; then
+        echo "llm-server $1 already running on port $PORT"
+        return 0
+    fi
+    if [[ "$1" != embed && -z "${LLM_ALLOW_BOTH:-}" ]]; then
+        local other
+        other="$(heavy_running "$1")"
+        if [[ -n "$other" ]]; then
+            echo "llm-server $other is running and two large models rarely fit in RAM;" \
+                "stop it first (llm-server stop $other) or set LLM_ALLOW_BOTH=1" >&2
+            return 1
+        fi
+    fi
+    [[ -x "$LLM_SERVER" ]] || { echo "llama-server not found; set LLM_SERVER" >&2; return 1; }
+    [[ -f "$MODEL" ]] || { echo "model not found: $MODEL (llm-server download $1)" >&2; return 1; }
+    memory_fits || return 1
+    mkdir -p "$STATE"
+    # dio: read the model straight into RAM, so it is not also held in the page cache.
+    # Lowest CPU priority and best-effort lowest I/O priority, so everything else wins.
+    setsid nohup nice -n "$LLM_NICE" ionice -c 2 -n 7 "$LLM_SERVER" -m "$MODEL" --alias "$ALIAS" \
+        --host 127.0.0.1 --port "$PORT" -c "$CTX" -np 1 -b "$BATCH" -ub "$BATCH" \
+        -t "$THREADS" -tb "$BATCH_THREADS" --load-mode dio "${EXTRA[@]}" \
+        >"$LOG" 2>&1 </dev/null &
+    local pid=$!
+    echo -n "Loading $ALIAS ($1, $LLM_PROFILE: $THREADS/$BATCH_THREADS threads, nice $LLM_NICE; can take a few minutes)"
+    for _ in $(seq 1 600); do
+        if healthy; then echo " ready on http://127.0.0.1:$PORT/v1"; return 0; fi
+        if ! kill -0 "$pid" 2>/dev/null; then echo; tail -5 "$LOG" >&2; return 1; fi
+        echo -n "."
+        sleep 2
+    done
+    echo " timed out; see $LOG" >&2
+    return 1
+}
+
+stop() {
+    preset "$1"
+    local pid
+    pid="$(server_pid)"
+    if [[ -z "$pid" ]]; then
+        echo "$1: not running"
+        return 0
+    fi
+    kill "$pid"
+    for _ in $(seq 1 30); do
+        kill -0 "$pid" 2>/dev/null || { echo "$1: stopped"; return 0; }
+        sleep 1
+    done
+    kill -9 "$pid" 2>/dev/null || true
+    echo "$1: killed"
+}
+
+status() {
+    preset "$1"
+    local pid
+    pid="$(server_pid)"
+    if healthy; then
+        echo "$1: running on http://127.0.0.1:$PORT/v1 ($ALIAS), RSS $(($(ps -o rss= -p "$pid") / 1024)) MiB"
+    elif [[ -n "$pid" ]]; then
+        echo "$1: loading"
+    else
+        echo "$1: stopped"
+        return 3
+    fi
+}
+
+download() {
+    preset "$1"
+    if [[ -f "$MODEL" ]]; then
+        echo "$MODEL already exists"
+        return 0
+    fi
+    mkdir -p "$(dirname "$MODEL")"
+    nice -n "$LLM_NICE" ionice -c 2 -n 7 python3 -I - "$SOURCE" "$MODEL" "${LLM_DOWNLOAD_RATE:-50}" <<'PY'
+"""Downloads a Docker Hub ai/ model's GGUF layer: rate-limited, resumable, verified."""
+import hashlib, json, os, shutil, sys, time, urllib.error, urllib.request
+
+ref, path, rate = sys.argv[1], sys.argv[2], float(sys.argv[3]) * 1e6
+repo, _, tag = ref.partition(":")
+registry = f"https://registry-1.docker.io/v2/ai/{repo}"
+part = path + ".part"
+CHUNK, FLUSH_EVERY, ATTEMPTS = 1 << 20, 64 << 20, 20
+ACCEPT = ("application/vnd.oci.image.manifest.v1+json, application/vnd.oci.image.index.v1+json, "
+          "application/vnd.docker.distribution.manifest.v2+json")
+
+
+def token():
+    url = f"https://auth.docker.io/token?service=registry.docker.io&scope=repository:ai/{repo}:pull"
+    with urllib.request.urlopen(url, timeout=60) as response:
+        return json.load(response)["token"]
+
+
+def get(url, auth, accept=None, offset=0):
+    request = urllib.request.Request(url, headers={"Authorization": "Bearer " + auth})
+    if accept:
+        request.add_header("Accept", accept)
+    if offset:
+        request.add_header("Range", f"bytes={offset}-")
+    return urllib.request.urlopen(request, timeout=60)
+
+
+def model_layer(auth):
+    with get(f"{registry}/manifests/{tag}", auth, ACCEPT) as response:
+        manifest = json.load(response)
+    if "manifests" in manifest:  # an index: models have a single manifest in it
+        with get(f"{registry}/manifests/{manifest['manifests'][0]['digest']}", auth, ACCEPT) as response:
+            manifest = json.load(response)
+    layers = manifest.get("layers", [])
+    weights = [layer for layer in layers if "gguf" in layer["mediaType"] or "model.weight" in layer["mediaType"]]
+    if len(weights) != 1:
+        sys.exit(f"ai/{ref}: expected one model layer, found {[layer['mediaType'] for layer in layers]}")
+    return weights[0]
+
+
+class Throttle:
+    """Sleeps as needed to keep a byte stream at or under rate bytes per second."""
+
+    def __init__(self):
+        self.started, self.done = time.monotonic(), 0
+
+    def __call__(self, count):
+        self.done += count
+        ahead = self.done / rate - (time.monotonic() - self.started)
+        if ahead > 0:
+            time.sleep(ahead)
+
+
+def evict(fd, upto):
+    """Writes out the file's cached pages and drops them: on WSL the cache grows the VM."""
+    os.fdatasync(fd)
+    os.posix_fadvise(fd, 0, upto, os.POSIX_FADV_DONTNEED)
+
+
+def show(label, done, total, started, base):
+    speed = (done - base) / max(time.monotonic() - started, 1e-3) / 1e6
+    print(f"\r  {label} {done / 1e9:6.2f} / {total / 1e9:.2f} GB  {speed:5.1f} MB/s ",
+          end="", file=sys.stderr, flush=True)
+
+
+def hash_existing(total):
+    """Hashes an earlier attempt's .part file (at the capped rate) so the download resumes."""
+    digest, done, throttle, started = hashlib.sha256(), 0, Throttle(), time.monotonic()
+    with open(part, "rb") as file:
+        while chunk := file.read(CHUNK):
+            digest.update(chunk)
+            done += len(chunk)
+            throttle(len(chunk))
+            if done % FLUSH_EVERY < CHUNK:
+                os.posix_fadvise(file.fileno(), 0, done, os.POSIX_FADV_DONTNEED)
+                show("checking", done, total, started, 0)
+        os.posix_fadvise(file.fileno(), 0, 0, os.POSIX_FADV_DONTNEED)
+    print(file=sys.stderr)
+    return digest, done
+
+
+try:
+    layer = model_layer(token())
+    total = layer["size"]
+    algorithm, expected = layer["digest"].split(":")
+    if algorithm != "sha256":
+        sys.exit(f"unexpected digest {layer['digest']}")
+    offset = os.path.getsize(part) if os.path.exists(part) else 0
+    if offset > total:
+        os.truncate(part, 0)
+        offset = 0
+    needed = total - offset + (1 << 30)
+    free = shutil.disk_usage(os.path.dirname(path)).free
+    if free < needed:
+        sys.exit(f"{os.path.dirname(path)} has {free / 1e9:.1f} GB free; the download needs {needed / 1e9:.1f} GB")
+    print(f"Downloading ai/{ref} ({total / 1e9:.2f} GB, at most {rate / 1e6:.0f} MB/s) to {path}", file=sys.stderr)
+    digest = hashlib.sha256()
+    if offset:
+        print(f"  resuming {part} at {offset / 1e9:.2f} GB", file=sys.stderr)
+        digest, offset = hash_existing(total)
+
+    for attempt in range(1, ATTEMPTS + 1):
+        try:
+            # A fresh token each attempt: Docker Hub's expire after about 5 minutes.
+            with get(f"{registry}/blobs/{layer['digest']}", token(), offset=offset) as response:
+                if offset and response.status != 206:  # no range support: start over
+                    os.truncate(part, 0)
+                    digest, offset = hashlib.sha256(), 0
+                with open(part, "ab") as file:
+                    throttle, started, base, flushed = Throttle(), time.monotonic(), offset, offset
+                    while chunk := response.read(CHUNK):
+                        file.write(chunk)
+                        digest.update(chunk)
+                        offset += len(chunk)
+                        throttle(len(chunk))
+                        if offset - flushed >= FLUSH_EVERY:
+                            file.flush()
+                            evict(file.fileno(), offset)
+                            flushed = offset
+                            show("downloading", offset, total, started, base)
+                    file.flush()
+                    evict(file.fileno(), offset)
+            if offset >= total:
+                break
+        except (urllib.error.URLError, OSError, TimeoutError) as error:
+            if isinstance(error, urllib.error.HTTPError) and error.code in (401, 403, 404):
+                raise
+            # Keep exactly the bytes that were hashed, so a half-written chunk cannot slip in.
+            if os.path.exists(part):
+                os.truncate(part, offset)
+            print(f"\n  interrupted at {offset / 1e9:.2f} GB ({error}); retrying ({attempt}/{ATTEMPTS})",
+                  file=sys.stderr)
+            time.sleep(min(10 * attempt, 60))
+    else:
+        sys.exit(f"gave up after {ATTEMPTS} attempts; run the download again to resume")
+    print(file=sys.stderr)
+    if offset != total or digest.hexdigest() != expected:
+        os.remove(part)
+        sys.exit(f"checksum mismatch ({offset} of {total} bytes); removed {part}, download again")
+    os.replace(part, path)
+    print(f"Verified sha256 and saved {path}", file=sys.stderr)
+except KeyboardInterrupt:
+    sys.exit(f"\nstopped; run the download again to resume from {part}")
+except urllib.error.HTTPError as error:
+    sys.exit(f"Docker Hub: {error.code} {error.reason} for ai/{ref} ({error.url})")
+except urllib.error.URLError as error:
+    sys.exit(f"cannot reach Docker Hub ({error.reason}); set HTTPS_PROXY if this network needs a proxy")
+PY
+}
+
+# completion_script: bash completion for commands and presets.
+completion_script() {
+    cat <<'BASH'
+_llm_server() {
+    local current="${COMP_WORDS[COMP_CWORD]}"
+    case "$COMP_CWORD" in
+    1) mapfile -t COMPREPLY < <(compgen -W "start stop status log download completion" -- "$current") ;;
+    2)
+        case "${COMP_WORDS[1]}" in
+        start | stop | status | log | download) mapfile -t COMPREPLY < <(compgen -W "code digest embed" -- "$current") ;;
+        completion) mapfile -t COMPREPLY < <(compgen -W "--install" -- "$current") ;;
+        esac
+        ;;
+    esac
+}
+complete -F _llm_server llm-server
+BASH
+}
+
+command="${1:-status}"
+target="${2:-}"
+if [[ "$command" == completion ]]; then
+    if [[ "$target" == --install ]]; then
+        file="${XDG_DATA_HOME:-$HOME/.local/share}/bash-completion/completions/llm-server"
+        mkdir -p "$(dirname "$file")"
+        completion_script >"$file"
+        echo "Installed bash completion to $file (open a new shell)"
+    else
+        completion_script
+    fi
+    exit 0
+fi
+case "$command" in
+start | log | download)
+    target="${target:-code}"
+    preset "$target" >/dev/null
+    ;;
+stop | status)
+    [[ -n "$target" ]] && preset "$target" >/dev/null
+    ;;
+*)
+    echo "usage: llm-server start|stop|status|log|download [${PRESETS[*]// /|}] | completion [--install]" >&2
+    exit 2
+    ;;
+esac
+
+case "$command" in
+start) start "$target" ;;
+download) download "$target" ;;
+log)
+    preset "$target"
+    exec tail -f "$LOG"
+    ;;
+stop | status)
+    if [[ -n "$target" ]]; then
+        "$command" "$target"
+    else
+        result=0
+        for name in "${PRESETS[@]}"; do
+            "$command" "$name" || result=$?
+        done
+        # status exits 3 only when nothing runs, as before presets existed.
+        [[ "$command" == status && "$result" -ne 0 ]] && ! pgrep -x llama-server >/dev/null && exit 3
+        exit 0
+    fi
+    ;;
+esac

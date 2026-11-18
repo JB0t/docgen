@@ -1,0 +1,5 @@
+# Number of webserver replicas.
+replicas: 2
+image:
+  # Image repository.
+  repository: ghcr.io/acme/orchestrator

@@ -1,0 +1,17 @@
+# docgen settings for this repository: docgen documents itself.
+clis:
+  - name: docgen
+    run: [go, run, .]
+    dir: .
+    doc: USAGE.md
+ignore:
+  - values.yaml                 # Helm's file name in general, not a path here
+  - action.yml                  # GitHub Actions' file name in general (docgen gen docs)
+  - ansible.cfg                 # Ansible's config file name in general
+  - aks-request.md              # example request file in the docgen gen walkthrough
+  - azure_rm_aksnodepool        # deliberate typo in the docgen gen checks example
+llm:                            # for draft, code and ask: any OpenAI-compatible server
+  url: http://127.0.0.1:8081/v1
+  model: qwen3-coder-q8
+  max_source_toks: 22000
+  max_response_toks: 8000
